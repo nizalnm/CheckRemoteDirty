@@ -9,13 +9,15 @@ import sys
 from ftplib import FTP_TLS
 
 def calculate_file_hash_and_size(filepath):
-    """Calculates MD5 hash and size of a file."""
+    """Calculates normalized MD5 hash (no CRLF) and raw size of a file."""
     hash_md5 = hashlib.md5()
     size = 0
     try:
         with open(filepath, "rb") as f:
             for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
+                # Normalize: Strip CR and LF to be cross-platform safe
+                chunk_norm = chunk.replace(b'\r', b'').replace(b'\n', b'')
+                hash_md5.update(chunk_norm)
                 size += len(chunk)
         return hash_md5.hexdigest(), size
     except FileNotFoundError:
@@ -175,10 +177,12 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 if mdtm_resp.startswith('213'):
                      remote_mtime = mdtm_resp.split()[1]
                 
-                # Check hash (Standard mode)
+                # Check hash (Standard mode) with Normalization
                 h_md5 = hashlib.md5()
                 def handle_binary(more_data):
-                    h_md5.update(more_data)
+                    # Normalize: Strip CR and LF
+                    chunk_norm = more_data.replace(b'\r', b'').replace(b'\n', b'')
+                    h_md5.update(chunk_norm)
 
                 ftp.retrbinary(f"RETR {remote_path}", handle_binary)
                 remote_hash = h_md5.hexdigest()
@@ -232,7 +236,10 @@ def main():
             file_content = get_git_file_content(working_dir, rel_path)
             
             if file_content is not None:
-                file_hash = hashlib.md5(file_content).hexdigest()
+                # Normalize Git content before hashing
+                norm_content = file_content.replace(b'\r', b'').replace(b'\n', b'')
+                file_hash = hashlib.md5(norm_content).hexdigest()
+                
                 file_size = len(file_content)
                 timestamp = get_git_file_timestamp(working_dir, rel_path)
                 

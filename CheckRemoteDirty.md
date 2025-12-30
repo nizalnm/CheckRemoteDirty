@@ -65,8 +65,8 @@ Create a JSON file (e.g., `ftp_config.json`) with your connection details:
 *   `remote_root` (Optional): The directory on the remote server where the project files reside. Defaults to `/` if omitted.
 
 ## Output
-
-The script outputs a table showing the status of each file:
-*   **MATCH**: Local hash matches remote hash.
+ 
+ The script outputs a table showing the status of each file:
+*   **MATCH**: Local hash matches remote hash. (Hashes are calculated after stripping `\r` and `\n` to ignore line-ending differences).
 *   **DIFF HASH**: Local content differs from remote content.
 *   **MISSING**: File does not exist on the remote server.
