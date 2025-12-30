@@ -25,27 +25,47 @@ Run the script from the command line.
 | `--ftpConfig` | Path to the FTP configuration JSON file. If provided, performs the comparison against the remote server. |
 | `--checkSizeOnly` | **Optional**. If set, skip downloading/hashing files. Only compares file sizes. **Warning**: This mode is useless for cross-platform comparisons (e.g. Windows vs Linux) because line-endings (CRLF vs LF) cause size differences even if content matches. Use only if you are sure platforms match. |
 
-### Modes
- 
- You must specify **exactly one** of the following mutually exclusive modes:
- 
- **1. Check Git Dirty Files (HEAD) vs Remote (Common Usage)**
-Scans the current git status for modified files. For each modified file, it ignores the local working copy and instead fetches the content and timestamp from the **HEAD commit**. It then compares this committed version against the remote server. Untracked or added (but uncommitted) files are ignored/skipped.
-```bash
-python CheckRemoteDirty.py --workingDir "C:\MyProject" --vsGit "dirty_snapshot.json" --ftpConfig "ftp_config.json"
-```
+### Common Workflows
 
-**2. Check from existing Hash File**
-Uses a previously saved list of files (e.g., from a previous run) to check against the remote server.
-```bash
-python CheckRemoteDirty.py --workingDir "C:\MyProject" --vsHashFile "dirty_snapshot.json" --ftpConfig "ftp_config.json"
-```
+#### 1. "Pre-Flight" Safety Check (Recommended)
+**Goal**: You have local dirty changes you want to manually deploy. You want to ensure the specific files you are about to overwrite on the server have not been modified by someone else (i.e., ensure Remote == Git HEAD).
 
-**3. Update Hash File**
-Updates the hashes and timestamps in an existing snapshot file based on the current local state.
-```bash
-python CheckRemoteDirty.py --workingDir "C:\MyProject" --updateHashFile "dirty_snapshot.json"
-```
+*   **Command**:
+    ```bash
+    python CheckRemoteDirty.py --workingDir "." --vsGit "dirty.json" --ftpConfig "ftp.json"
+    ```
+*   **Logic**:
+    1.  Identifies your local dirty files.
+    2.  Fetches the *original* content of these files from `HEAD` (ignoring your local edits).
+    3.  Compares `HEAD` content vs `Remote`.
+    4.  **Result**:
+        *   **MATCH**: Remote is clean (synced with HEAD). Safe to deploy your changes.
+        *   **DIFF**: Remote has unknown changes! **Do not deploy** or you will overwrite them.
+
+#### 2. "Post-Deploy" Verification
+**Goal**: You just deployed your local dirty files. You want to verify they were uploaded correctly and match your local disk.
+
+*   **Command**:
+    ```bash
+    python CheckRemoteDirty.py --workingDir "." --updateHashFile "dirty.json" --ftpConfig "ftp.json"
+    ```
+*   **Logic**:
+    1.  Calculates hash of your *current local* dirty files.
+    2.  Updates `dirty.json` with these hashes.
+    3.  Compares `Local` vs `Remote`.
+    4.  **Result**:
+        *   **MATCH**: Deployment success.
+        *   **DIFF**: Upload failed or corruption occurred.
+
+### Command Reference
+
+**Mode Flags** (Pick exactly one):
+*   `--vsGit <file>`: Use Git HEAD as the source of truth (Safety Check).
+*   `--updateHashFile <file>`: Use Local Working Directory as source of truth (Verification).
+*   `--vsHashFile <file>`: Use a previously saved snapshot (Audit).
+
+**Options**:
+*   `--ftpConfig <file>`: required to perform the remote comparison.
 
 ## Configuration
 
