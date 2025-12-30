@@ -125,7 +125,7 @@ def connect_ftp(config):
     ftp.prot_p() # Secure data connection
     return ftp
 
-def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
+def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, deploy_on_clean=False, working_dir=None):
     """
     Compares local files (from hash file or git status) with remote FTP files.
     """
@@ -145,6 +145,8 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
         print("\n--- FTP Comparison Results ---")
         print(f"{'File':<{col_width}} | {'Status':<15} | {'Details':<30}")
         print("-" * (col_width + 15 + 30 + 6)) # Sum of widths + separators
+
+        deployable_candidates = [] if deploy_on_clean else None
 
         for item in file_data_list:
             rel_path = item['path'].replace('\\', '/')
@@ -193,6 +195,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 # Timestamp Comparison Operator
                 ts_op = "?"
                 if local_ts_display != 'N/A' and remote_mtime:
+                    if local_ts != 'N/A' and remote_mtime:
                     if local_ts_display > remote_mtime:
                         ts_op = ">" # Local is newer
                     elif local_ts_display < remote_mtime:
@@ -236,6 +239,145 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
 
             print(f"{rel_path:<{col_width}} | {status:<15} | {details}")
 
+            # Collect candidates for deployment
+            if deploy_on_clean:
+                # Safe conditions:
+                # 1. MATCH: Remote equals Local (Clean)
+                # 2. MATCH *: Remote equals Local (Clean, different size)
+                # 3. MISSING: Remote file doesn't exist
+                #
+                # Unsafe Condition:
+                # DIFF HASH: This is UNSAFE, do not deploy
+                
+                if status == "DIFF HASH":
+                    deployable = False
+                    print(f"WARNING: File {rel_path} differs from HEAD. Deployment unsafe.")
+                    deployable_candidates = None # Invalidate deployment
+                    break 
+
+                if status in ["MATCH", "MATCH *", "MISSING"]:
+                    deployable_candidates.append({
+                        "rel_path": rel_path,
+                        "remote_path": remote_path,
+                        "status": status,
+                        "local_path": os.path.join(working_dir, rel_path),
+                        "remote_mtime": remote_mtime, # for backup suffix
+                        "remote_size": remote_size
+                    })
+        
+        # End of comparison loop
+        
+        if deploy_on_clean and deployable_candidates is not None:
+            # All checks passed
+            if not deployable_candidates:
+                 print("\nNo files to deploy.")
+                 ftp.quit()
+                 return
+
+            print(f"\nAll {len(deployable_candidates)} remote files are clean (match HEAD or missing).")
+            response = input("Proceed with deployment? (Y/n): ").strip()
+            if response in ['Y', 'y', '']:
+                print("\nStarting deployment...")
+                backup_dir = os.path.join(working_dir, "tmp", "backups")
+                
+                failed_deploys = []
+
+                for item in deployable_candidates:
+                    rel_path = item['rel_path']
+                    remote_path = item['remote_path']
+                    local_path = item['local_path']
+                    
+                    try:
+                        # 1. Backup if exists
+                        if item['status'] != "MISSING":
+                            # Create nested dirs in backup folder
+                            backup_file_dir = os.path.join(backup_dir, os.path.dirname(rel_path))
+                            os.makedirs(backup_file_dir, exist_ok=True)
+                            
+                            # Construct backup filename
+                            # Append remote timestamp if available, else standard fallback
+                            ts_suffix = item['remote_mtime'].replace(':', '').replace(' ', '_').replace('-', '') if item['remote_mtime'] else datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                            backup_filename = f"{os.path.basename(rel_path)}.{ts_suffix}"
+                            backup_full_path = os.path.join(backup_file_dir, backup_filename)
+                            
+                            print(f"Backing up {rel_path} -> {backup_full_path} ...", end=" ")
+                            with open(backup_full_path, 'wb') as f_bk:
+                                ftp.retrbinary(f"RETR {remote_path}", f_bk.write)
+                            
+                            # Verify Backup Integrity
+                            backup_size = os.path.getsize(backup_full_path)
+                            if item['remote_size'] is not None and backup_size != item['remote_size']:
+                                raise Exception(f"Backup verification failed: Size mismatch (Remote: {item['remote_size']}, Backup: {backup_size})")
+                            
+                            print("Done (Verified).")
+
+                        # 2. Upload
+                        print(f"Uploading {rel_path} ...", end=" ")
+                        with open(local_path, 'rb') as f_up:
+                            ftp.storbinary(f"STOR {remote_path}", f_up)
+
+                        print("Done.")
+                        
+                        # 3. Verification & Retry
+                        max_retries = 3
+                        verified = False
+                        for attempt in range(max_retries + 1):
+                             # Calculate remote hash again
+                             h_check = hashlib.md5()
+                             def handle_check(data):
+                                 chunk_norm = data.replace(b'\r', b'').replace(b'\n', b'')
+                                 h_check.update(chunk_norm)
+                             
+                             ftp.retrbinary(f"RETR {remote_path}", handle_check)
+                             remote_check_hash = h_check.hexdigest()
+                             
+                             # Calculate expected hash from local file again (fresh read)
+                             # We can use the hash from inputs, assuming local file didn't change mid-script
+                             # But best to be safe and re-read local or trust pre-calc.
+                             # Let's trust the one we just uploaded based on file content.
+                             
+                             # Re-calculate local hash for verification
+                             h_local_check = hashlib.md5()
+                             with open(local_path, "rb") as f_re:
+                                 for chunk in iter(lambda: f_re.read(4096), b""):
+                                     chunk_norm = chunk.replace(b'\r', b'').replace(b'\n', b'')
+                                     h_local_check.update(chunk_norm)
+                             local_check_hash = h_local_check.hexdigest()
+
+                             if remote_check_hash == local_check_hash:
+                                 verified = True
+                                 print(f"Verified.")
+                                 break
+                             else:
+                                 if attempt < max_retries:
+                                     print(f"\nVerification FAILED (Attempt {attempt+1}/{max_retries}). Retrying upload...", end=" ")
+                                     # Retry upload
+                                     with open(local_path, 'rb') as f_up:
+                                        ftp.storbinary(f"STOR {remote_path}", f_up)
+                                     print("Uploaded. Verifying...", end=" ")
+                                 else:
+                                     print("\nVerification FAILED after all retries.")
+                        
+                        if not verified:
+                           failed_deploys.append(rel_path)
+
+                    except Exception as e:
+                        print(f"\nError processing {rel_path}: {e}")
+                        failed_deploys.append(rel_path)
+                
+                if failed_deploys:
+                    print("\nWARNING: Some files failed to deploy or verify correctly:")
+                    for fp in failed_deploys:
+                        print(f" - {fp}")
+                else:
+                    print("\nDeployment completed successfully.")
+
+            else:
+                print("Deployment cancelled by user.")
+        
+        elif deploy_on_clean and deployable_candidates is None:
+             print("\nDeployment ABORTED. Not all remote files are clean (match HEAD or missing).")
+
         ftp.quit()
 
     except Exception as e:
@@ -254,6 +396,7 @@ def main():
     
     parser.add_argument("--ftpConfig", "--ftpconfig", dest="ftpConfig", help="Path to FTP config JSON file.")
     parser.add_argument("--checkSizeOnly", "--checksizeonly", dest="checkSizeOnly", action="store_true", help="If set, only compares file sizes. Faster but less accurate regarding content equality (ignores line endings issues).")
+    parser.add_argument("--deployOnClean", "--deployonclean", dest="deployOnClean", action="store_true", help="If set, attempts to deploy files if remote is clean (matches Git HEAD or missing).")
 
     args = parser.parse_args()
     working_dir = os.path.abspath(args.workingDir)
@@ -341,9 +484,10 @@ def main():
     # FTP Comparison Step
     if args.ftpConfig: 
         if affected_files_data:
-            compare_with_ftp(args.ftpConfig, affected_files_data, check_size_only=args.checkSizeOnly)
+            compare_with_ftp(args.ftpConfig, affected_files_data, check_size_only=args.checkSizeOnly, deploy_on_clean=args.deployOnClean, working_dir=working_dir)
         else:
             print("No file data to compare with FTP.")
 
 if __name__ == "__main__":
     main()
+

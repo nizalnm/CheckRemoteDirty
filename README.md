@@ -24,6 +24,7 @@ Run the script from the command line.
 | `--updateHashFile` | Path to an existing JSON file. specific uses existing file list but updates hashes/timestamps based on current local files. |
 | `--ftpConfig` | Path to the FTP configuration JSON file. If provided, performs the comparison against the remote server. |
 | `--checkSizeOnly` | **Optional**. If set, skip downloading/hashing files. Only compares file sizes. **Warning**: This mode is useless for cross-platform comparisons (e.g. Windows vs Linux) because line-endings (CRLF vs LF) cause size differences even if content matches. Use only if you are sure platforms match. |
+| `--deployOnClean` | **Optional**. If set, and if all remote files are found to be "clean" (matching the source of truth, e.g., git HEAD), prompts to deploy the local dirty files. |
 
 ### Common Workflows
 
