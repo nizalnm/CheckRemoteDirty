@@ -152,9 +152,12 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
             rel_path = item['path'].replace('\\', '/')
             remote_path = f"{remote_root}/{rel_path}".replace('//', '/')
             
-            local_hash = item.get('hash', 'N/A')
-            local_ts = item.get('timestamp', 'N/A')
-            local_size = item.get('size', None)
+            # Support both old schema (hash/timestamp) and new (git_hash/local_hash/etc)
+            # Fallback for old schema files
+            local_hash = item.get('local_hash', item.get('hash', 'N/A'))
+            git_hash = item.get('git_hash', 'N/A')
+            local_ts = item.get('local_ts', item.get('timestamp', 'N/A'))
+            local_size = item.get('local_size', item.get('size', None))
             
             # Check if file exists remotely and get basic info
             remote_size = None
@@ -195,7 +198,6 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                 # Timestamp Comparison Operator
                 ts_op = "?"
                 if local_ts_display != 'N/A' and remote_mtime:
-                    if local_ts != 'N/A' and remote_mtime:
                     if local_ts_display > remote_mtime:
                         ts_op = ">" # Local is newer
                     elif local_ts_display < remote_mtime:
@@ -213,20 +215,23 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                 ftp.retrbinary(f"RETR {remote_path}", handle_binary)
                 remote_hash = h_md5.hexdigest()
 
-                status = "MATCH"
+                status = ""
                 details = ""
                 
-                if local_hash != remote_hash:
+                # Dual Hash Comparison Logic
+                if remote_hash == local_hash:
+                    status = "MATCH LOCAL"
+                elif remote_hash == git_hash:
+                    status = "MATCH GIT" 
+                else:
                     status = "DIFF HASH"
-                elif local_size != remote_size:
-                    # Hash matches, but size differs -> Likely Line Endings
-                    status = "MATCH *"
-                    details = "Line Endings differ. "
+                    if local_size != remote_size:
+                         # Likely Line Endings if strictly hashing but size diff, 
+                         # but here we normalized, so it's a genuine content match/diff.
+                         pass
                 
                 # Add Timestamps to Details
                 details += f"[L: {local_ts_display} {ts_op} R: {remote_mtime or 'N/A'}]"
-                
-                # Check timestamp logic if needed, but hash is authoritative for content
                 
             except ftplib.error_perm as e:
                 status = "MISSING"
@@ -242,20 +247,24 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
             # Collect candidates for deployment
             if deploy_on_clean:
                 # Safe conditions:
-                # 1. MATCH: Remote equals Local (Clean)
-                # 2. MATCH *: Remote equals Local (Clean, different size)
-                # 3. MISSING: Remote file doesn't exist
+                # 1. MATCH GIT: Remote equals Git HEAD (Clean, not yet deployed) -> DEPLOY
+                # 2. MATCH LOCAL: Remote equals Local (Already deployed) -> SKIP
+                # 3. MISSING: Remote file doesn't exist -> DEPLOY
                 #
                 # Unsafe Condition:
-                # DIFF HASH: This is UNSAFE, do not deploy
+                # DIFF HASH: Remote matches neither (Potential unknown change) -> UNSAFE
+                
+                if status == "MATCH LOCAL":
+                    print(f"Skipping {rel_path} (Already matches local)")
+                    continue
                 
                 if status == "DIFF HASH":
                     deployable = False
-                    print(f"WARNING: File {rel_path} differs from HEAD. Deployment unsafe.")
+                    print(f"WARNING: File {rel_path} differs from both HEAD and Local. Unknown remote state. Deployment unsafe.")
                     deployable_candidates = None # Invalidate deployment
                     break 
 
-                if status in ["MATCH", "MATCH *", "MISSING"]:
+                if status in ["MATCH GIT", "MISSING"]:
                     deployable_candidates.append({
                         "rel_path": rel_path,
                         "remote_path": remote_path,
@@ -414,27 +423,39 @@ def main():
         
         print(f"\n--- Local Dirty Files (HEAD) ---")
         for rel_path in dirty_files:
-            # For vsGit mode, we now fetch content/timestamp from HEAD
-            file_content = get_git_file_content(working_dir, rel_path)
+            # For vsGit mode, we fetch BOTH content/timestamp from HEAD and Local
             
-            if file_content is not None:
-                # Normalize Git content before hashing
-                norm_content = file_content.replace(b'\r', b'').replace(b'\n', b'')
-                file_hash = hashlib.md5(norm_content).hexdigest()
-                
-                file_size = len(file_content)
-                timestamp = get_git_file_timestamp(working_dir, rel_path)
-                
-                print(f"{rel_path:<50} | {timestamp}")
-                affected_files_data.append({
-                    "path": rel_path,
-                    "hash": file_hash,
-                    "size": file_size,
-                    "timestamp": timestamp
-                })
-            else:
-                # File present in dirty list (e.g. added/staged) but not in HEAD.
-                print(f"Skipping {rel_path} (not found in HEAD)")
+            # 1. GIT INFO (HEAD)
+            git_content = get_git_file_content(working_dir, rel_path)
+            git_hash = "N/A"
+            git_ts = "N/A"
+            
+            if git_content is not None:
+                norm_git_content = git_content.replace(b'\r', b'').replace(b'\n', b'')
+                git_hash = hashlib.md5(norm_git_content).hexdigest()
+                git_ts = get_git_file_timestamp(working_dir, rel_path)
+            
+            # 2. LOCAL INFO (Working Dir)
+            abs_path = os.path.join(working_dir, rel_path)
+            local_hash, local_size = calculate_file_hash_and_size(abs_path)
+            local_ts = get_file_timestamp(abs_path)
+            
+            if local_hash is None:
+                # File might be deleted locally but present in git dirty checks?
+                local_hash = "N/A"
+                local_size = 0
+                local_ts = "N/A"
+
+            print(f"{rel_path:<50} | Git: {git_ts} | Local: {local_ts}")
+            
+            affected_files_data.append({
+                "path": rel_path,
+                "git_hash": git_hash,
+                "git_ts": git_ts,
+                "local_hash": local_hash,
+                "local_size": local_size,
+                "local_ts": local_ts
+            })
         
         save_json(args.vsGit, affected_files_data)
         print(f"\nSaved {len(affected_files_data)} dirty file records to {args.vsGit}")
@@ -463,17 +484,27 @@ def main():
         # Update map
         for rel_path in dirty_files:
             abs_path = os.path.join(working_dir, rel_path)
-            file_hash, file_size = calculate_file_hash_and_size(abs_path)
-            timestamp = get_file_timestamp(abs_path)
+            local_hash, local_size = calculate_file_hash_and_size(abs_path)
+            local_ts = get_file_timestamp(abs_path)
             
-            if file_hash:
-                print(f"{rel_path:<50} | {timestamp}")
-                existing_map[rel_path] = {
-                    "path": rel_path,
-                    "hash": file_hash,
-                    "size": file_size,
-                    "timestamp": timestamp
-                }
+            if local_hash:
+                print(f"{rel_path:<50} | {local_ts}")
+                
+                # Create base record if not exists
+                if rel_path not in existing_map:
+                    existing_map[rel_path] = {}
+                
+                # Update Local fields
+                existing_map[rel_path]['path'] = rel_path
+                existing_map[rel_path]['local_hash'] = local_hash
+                existing_map[rel_path]['local_size'] = local_size
+                existing_map[rel_path]['local_ts'] = local_ts
+                
+                # Ensure git fields exist (set to N/A if missing, don't overwrite if present)
+                if 'git_hash' not in existing_map[rel_path]:
+                     existing_map[rel_path]['git_hash'] = "N/A"
+                if 'git_ts' not in existing_map[rel_path]:
+                     existing_map[rel_path]['git_ts'] = "N/A"
         
         affected_files_data = list(existing_map.values())
         save_json(args.updateHashFile, affected_files_data)
