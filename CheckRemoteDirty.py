@@ -192,7 +192,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 remote_hash = h_md5.hexdigest()
 
                 status = "MATCH"
-                details = f"Hash: {remote_hash[:8]}..."
+                details = f"Hash: {remote_hash}"
                 
                 if local_hash != remote_hash:
                     status = "DIFF HASH"
@@ -205,7 +205,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 
             except ftplib.error_perm as e:
                 status = "MISSING"
-                details = f"Remote error: {str(e)[:20]}..."
+                details = f"Remote error: {str(e)}"
                 remote_hash = "N/A"
 
             print(f"{rel_path:<{col_width}} | {status:<15} | {details}")
