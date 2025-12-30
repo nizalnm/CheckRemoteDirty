@@ -26,10 +26,10 @@ Run the script from the command line.
 | `--checkSizeOnly` | **Optional**. If set, skip downloading/hashing files. Only compares file sizes. **Warning**: This mode is useless for cross-platform comparisons (e.g. Windows vs Linux) because line-endings (CRLF vs LF) cause size differences even if content matches. Use only if you are sure platforms match. |
 
 ### Modes
-
-You must specify one of the following modes:
-
-**1. Check Git Dirty Files (HEAD) vs Remote (Common Usage)**
+ 
+ You must specify **exactly one** of the following mutually exclusive modes:
+ 
+ **1. Check Git Dirty Files (HEAD) vs Remote (Common Usage)**
 Scans the current git status for modified files. For each modified file, it ignores the local working copy and instead fetches the content and timestamp from the **HEAD commit**. It then compares this committed version against the remote server. Untracked or added (but uncommitted) files are ignored/skipped.
 ```bash
 python CheckRemoteDirty.py --workingDir "C:\MyProject" --vsGit "dirty_snapshot.json" --ftpConfig "ftp_config.json"
