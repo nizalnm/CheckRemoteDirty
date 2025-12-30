@@ -287,7 +287,11 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
             response = input("Proceed with deployment? (Y/n): ").strip()
             if response in ['Y', 'y', '']:
                 print("\nStarting deployment...")
-                backup_dir = os.path.join(working_dir, "tmp", "backups")
+                print("\nStarting deployment...")
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                project_name = os.path.basename(working_dir)
+                backup_dir = os.path.join(script_dir, "backups", project_name)
+                print(f"Backups will be stored in: {backup_dir}")
                 
                 failed_deploys = []
 

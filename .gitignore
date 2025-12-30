@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 
 *.ps1
+/backups
