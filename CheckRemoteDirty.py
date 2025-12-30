@@ -227,7 +227,11 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 
             except ftplib.error_perm as e:
                 status = "MISSING"
-                details = f"Remote error: {str(e)}"
+                error_msg = str(e)
+                if "550" in error_msg:
+                    details = "" # Suppress expected 550 error
+                else:
+                    details = f"Remote error: {error_msg}"
                 remote_hash = "N/A"
 
             print(f"{rel_path:<{col_width}} | {status:<15} | {details}")
