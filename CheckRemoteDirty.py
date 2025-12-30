@@ -138,9 +138,13 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
         ftp = connect_ftp(config)
         remote_root = config.get('remote_root', '/')
         
+        # Calculate dynamic column width
+        max_path_len = max([len(item['path']) for item in file_data_list]) if file_data_list else 40
+        col_width = max(40, max_path_len + 2)
+        
         print("\n--- FTP Comparison Results ---")
-        print(f"{'File':<40} | {'Status':<15} | {'Remote Info':<30}")
-        print("-" * 90)
+        print(f"{'File':<{col_width}} | {'Status':<15} | {'Remote Info':<30}")
+        print("-" * (col_width + 15 + 30 + 6)) # Sum of widths + separators
 
         for item in file_data_list:
             rel_path = item['path'].replace('\\', '/')
@@ -163,11 +167,11 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 if check_size_only:
                     if local_size is not None and remote_size is not None:
                         if local_size != remote_size:
-                            print(f"{rel_path:<40} | {'DIFF SIZE':<15} | Local: {local_size} vs Remote: {remote_size} (Hint: possible line-ending diff)")
+                            print(f"{rel_path:<{col_width}} | {'DIFF SIZE':<15} | Local: {local_size} vs Remote: {remote_size} (Hint: possible line-ending diff)")
                         else:
-                            print(f"{rel_path:<40} | {'MATCH (Size)':<15} | Size: {local_size}")
+                            print(f"{rel_path:<{col_width}} | {'MATCH (Size)':<15} | Size: {local_size}")
                     else:
-                         print(f"{rel_path:<40} | {'MISSING/UNK':<15} | Cannot compare size")
+                         print(f"{rel_path:<{col_width}} | {'MISSING/UNK':<15} | Cannot compare size")
                     
                     # Skip hash check
                     continue
@@ -204,7 +208,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 details = f"Remote error: {str(e)[:20]}..."
                 remote_hash = "N/A"
 
-            print(f"{rel_path:<40} | {status:<15} | {details}")
+            print(f"{rel_path:<{col_width}} | {status:<15} | {details}")
 
         ftp.quit()
 
