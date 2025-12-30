@@ -163,7 +163,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 if check_size_only:
                     if local_size is not None and remote_size is not None:
                         if local_size != remote_size:
-                            print(f"{rel_path:<40} | {'DIFF SIZE':<15} | Local: {local_size} vs Remote: {remote_size}")
+                            print(f"{rel_path:<40} | {'DIFF SIZE':<15} | Local: {local_size} vs Remote: {remote_size} (Hint: possible line-ending diff)")
                         else:
                             print(f"{rel_path:<40} | {'MATCH (Size)':<15} | Size: {local_size}")
                     else:
@@ -192,6 +192,10 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 
                 if local_hash != remote_hash:
                     status = "DIFF HASH"
+                elif local_size != remote_size:
+                    # Hash matches, but size differs -> Likely Line Endings
+                    status = "MATCH *"
+                    details += " (Line Endings differ)"
                 
                 # Check timestamp logic if needed, but hash is authoritative for content
                 

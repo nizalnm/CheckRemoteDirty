@@ -1,6 +1,6 @@
 # CheckRemoteDirty
 
-A Python utility to verify if locally modified (dirty) files in a Git repository differ from those deployed on a remote FTP server. This helps ensure that your local changes are in sync with or different from what is currently live.
+A Python utility to verify if locally modified (dirty) files in a Git repository differ from those deployed on a remote FTP server. This helps determine whether your local changes are in sync with or different from what is currently live. This is especially useful when your project does not have proper CI/CD set up and your teammates have the annoying habit of not committing their changes before deploying to the remote server. By comparing your own local hash snapshots with the remote server before deployment, you can avoid accidentally wiping out someone else's hard work, their grave sin of git-slacking notwithstanding. 
 
 ## Prerequisites
 
@@ -23,7 +23,7 @@ Run the script from the command line.
 | `--vsHashFile` | Path to an existing JSON file. Loads the list of files to check from this file. |
 | `--updateHashFile` | Path to an existing JSON file. specific uses existing file list but updates hashes/timestamps based on current local files. |
 | `--ftpConfig` | Path to the FTP configuration JSON file. If provided, performs the comparison against the remote server. |
-| `--checkSizeOnly` | **Optional**. If set, skip downloading/hashing files. Only compares file sizes. Faster, but ignores content changes if size remains identical (and ignores line-ending diffs). |
+| `--checkSizeOnly` | **Optional**. If set, skip downloading/hashing files. Only compares file sizes. **Warning**: This mode is useless for cross-platform comparisons (e.g. Windows vs Linux) because line-endings (CRLF vs LF) cause size differences even if content matches. Use only if you are sure platforms match. |
 
 ### Modes
 
