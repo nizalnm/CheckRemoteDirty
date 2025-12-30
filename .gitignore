@@ -1,6 +1,7 @@
 
 # Ignore all json files (config and metadata)
 *.json
+!sample_ftp_config.json
 __pycache__/
 *.pyc
 

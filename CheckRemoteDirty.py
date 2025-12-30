@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import subprocess
 import hashlib
@@ -108,11 +109,11 @@ def get_git_file_timestamp(repo_path, rel_path):
 def load_json(filepath):
     if not os.path.exists(filepath):
         return None
-    with open(filepath, 'r') as f:
+    with open(filepath, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 def save_json(filepath, data):
-    with open(filepath, 'w') as f:
+    with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4)
 
 def connect_ftp(config):

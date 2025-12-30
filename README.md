@@ -72,19 +72,21 @@ Run the script from the command line.
 
 ## Configuration
 
-### FTP Config File
-Create a JSON file (e.g., `ftp_config.json`) with your connection details:
+### 2. FTP Configuration
+
+Create a JSON file (e.g., `myconfig.json`) with your FTP credentials.
+> **Tip**: Use `sample_ftp_config.json` as a template.
 
 ```json
 {
     "host": "ftp.example.com",
-    "port": 21,
-    "user": "ftp_user",
+    "user": "your_username",
     "password": "your_password",
-    "remote_root": "/public_html/myapp"
+    "port": 21,
+    "remote_root": "/public_html/"
 }
 ```
-
+**Security Note**: Add specific config filenames (like `*config.json`) to your `.gitignore` to avoid committing secrets.
 *   `remote_root` (Optional): The directory on the remote server where the project files reside. Defaults to `/` if omitted.
 
 ## Output
@@ -92,4 +94,19 @@ Create a JSON file (e.g., `ftp_config.json`) with your connection details:
  The script outputs a table showing the status of each file:
 *   **MATCH**: Local hash matches remote hash. (Hashes are calculated after stripping `\r` and `\n` to ignore line-ending differences).
 *   **DIFF HASH**: Local content differs from remote content.
-*   **MISSING**: File does not exist on the remote server.
+
+## Quick Start Scripts
+
+Sample batch (`.bat`) and shell (`.sh`) scripts are provided to help you get started quickly.
+
+1.  **Copy** the sample scripts (`project_preflight`, `project_deploy`, `project_postdeploy`) to your preferred location or rename them (e.g., `myapp_deploy.bat`).
+2.  **Edit** the scripts and update the arguments as detailed in the comments within each file:
+    *   `--workingDir`: Set this to your project's root folder.
+    *   `--vsGit` / `--updateHashFile`: Set a unique JSON filename for your project (e.g., `myapp_hashes.json`).
+    *   `--ftpConfig`: Point to your specific FTP config file (e.g., `myapp_ftp.json`).
+
+### Script Types
+*   **Preflight** (`preflight`): Runs a safety check. Tells you if the remote server matches Git HEAD. Use this before deciding to deploy.
+*   **Deploy** (`deploy`): Runs the safety check, and if safe, backs up remote files and deploys your local changes.
+*   **Post-Deploy** (`postdeploy`): Verifies that the files currently on the server match your local files. Use this after deployment to ensure integrity.
+

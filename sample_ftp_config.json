@@ -1,0 +1,7 @@
+{
+    "host": "ftp.example.com",
+    "user": "your_username",
+    "password": "your_password",
+    "port": 21,
+    "remote_root": "/public_html/"
+}
