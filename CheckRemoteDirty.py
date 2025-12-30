@@ -179,7 +179,16 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 # Try to get modification time (MDTM yyyyMMddHHmmss)
                 mdtm_resp = ftp.voidcmd(f"MDTM {remote_path}")
                 if mdtm_resp.startswith('213'):
-                     remote_mtime = mdtm_resp.split()[1]
+                     # Parse YYYYMMDDHHMMSS -> YYYY-MM-DD HH:MM:SS
+                     raw = mdtm_resp.split()[1]
+                     if len(raw) >= 14:
+                        remote_mtime = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]} {raw[8:10]}:{raw[10:12]}:{raw[12:14]}"
+                     else:
+                        remote_mtime = raw
+
+                # Format Local Timestamp (ISO) for display
+                # usually "YYYY-MM-DDTHH:MM:SS.ssssss" -> "YYYY-MM-DD HH:MM:SS"
+                local_ts_display = local_ts.replace('T', ' ')[:19] if local_ts != 'N/A' else 'N/A'
                 
                 # Check hash (Standard mode) with Normalization
                 h_md5 = hashlib.md5()
@@ -199,7 +208,10 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 elif local_size != remote_size:
                     # Hash matches, but size differs -> Likely Line Endings
                     status = "MATCH *"
-                    details = "Line Endings differ"
+                    details = "Line Endings differ. "
+                
+                # Add Timestamps to Details
+                details += f"[L: {local_ts_display} | R: {remote_mtime or 'N/A'}]"
                 
                 # Check timestamp logic if needed, but hash is authoritative for content
                 
