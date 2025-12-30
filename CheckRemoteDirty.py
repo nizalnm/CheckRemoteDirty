@@ -190,6 +190,16 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                 # usually "YYYY-MM-DDTHH:MM:SS.ssssss" -> "YYYY-MM-DD HH:MM:SS"
                 local_ts_display = local_ts.replace('T', ' ')[:19] if local_ts != 'N/A' else 'N/A'
                 
+                # Timestamp Comparison Operator
+                ts_op = "?"
+                if local_ts_display != 'N/A' and remote_mtime:
+                    if local_ts_display > remote_mtime:
+                        ts_op = ">" # Local is newer
+                    elif local_ts_display < remote_mtime:
+                        ts_op = "<" # Remote is newer
+                    else:
+                        ts_op = "=" # Same time
+                
                 # Check hash (Standard mode) with Normalization
                 h_md5 = hashlib.md5()
                 def handle_binary(more_data):
@@ -211,7 +221,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
                     details = "Line Endings differ. "
                 
                 # Add Timestamps to Details
-                details += f"[L: {local_ts_display} | R: {remote_mtime or 'N/A'}]"
+                details += f"[L: {local_ts_display} {ts_op} R: {remote_mtime or 'N/A'}]"
                 
                 # Check timestamp logic if needed, but hash is authoritative for content
                 
