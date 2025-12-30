@@ -113,6 +113,16 @@ def save_json(filepath, data):
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=4)
 
+def connect_ftp(config):
+    """
+    Connects to FTP server using config.
+    """
+    ftp = FTP_TLS()
+    ftp.connect(config['host'], config.get('port', 21))
+    ftp.login(config['user'], config['password'])
+    ftp.prot_p() # Secure data connection
+    return ftp
+
 def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
     """
     Compares local files (from hash file or git status) with remote FTP files.
