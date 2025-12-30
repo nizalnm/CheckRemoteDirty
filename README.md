@@ -28,7 +28,7 @@ Run the script from the command line.
 ### Common Workflows
 
 #### 1. "Pre-Flight" Safety Check (Recommended)
-**Goal**: You have local dirty changes you want to manually deploy, yet you feel it is too insignificant to git-commit first (Hold the pitchforks o CI/CD crusaders! I am but a wee bit of a web developer). You want to ensure the specific files you are about to overwrite on the server have not been modified by someone else (i.e., ensure Remote == Git HEAD).
+**Goal**: You have local dirty changes you want to manually deploy, yet you feel it is too insignificant to git-commit first *(Hold the pitchforks o CI/CD crusaders! I am but a wee bit of a web developer)*. You want to ensure the specific files you are about to overwrite on the server have not been modified by someone else (i.e., ensure Remote == Git HEAD).
 
 *   **Command**:
     ```bash
@@ -40,7 +40,7 @@ Run the script from the command line.
     3.  Compares `HEAD` content vs `Remote`.
     4.  **Result**:
         *   **MATCH**: Remote is clean (synced with HEAD). Safe to deploy your changes.
-        *   **DIFF**: Remote has unknown changes! **Do not deploy** or you will overwrite them.
+        *   **DIFF**: Remote has unknown changes! **Do not deploy as is** or you will overwrite them. Instead perform the tender loving care of merging the remote changes carefully into your local, before deploying (and committing the merged changes like the good chap you are).
 
 #### 2. "Post-Deploy" Verification
 **Goal**: You just deployed your local dirty files. You want to verify they were uploaded correctly and match your local disk.
