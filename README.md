@@ -28,7 +28,7 @@ Run the script from the command line.
 ### Common Workflows
 
 #### 1. "Pre-Flight" Safety Check (Recommended)
-**Goal**: You have local dirty changes you want to manually deploy, yet you feel it is too insignificant to git-commit first (Hold the pitchforks o CI/CD crusaders! I am but a wee bit smalltime web developer). You want to ensure the specific files you are about to overwrite on the server have not been modified by someone else (i.e., ensure Remote == Git HEAD).
+**Goal**: You have local dirty changes you want to manually deploy, yet you feel it is too insignificant to git-commit first (Hold the pitchforks o CI/CD crusaders! I am but a wee bit of a web developer). You want to ensure the specific files you are about to overwrite on the server have not been modified by someone else (i.e., ensure Remote == Git HEAD).
 
 *   **Command**:
     ```bash
