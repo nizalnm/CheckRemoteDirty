@@ -6,18 +6,20 @@ import json
 import ftplib
 import datetime
 import sys
-from ftplib import FTP
+from ftplib import FTP_TLS
 
-def calculate_file_hash(filepath):
-    """Calculates MD5 hash of a file."""
+def calculate_file_hash_and_size(filepath):
+    """Calculates MD5 hash and size of a file."""
     hash_md5 = hashlib.md5()
+    size = 0
     try:
         with open(filepath, "rb") as f:
             for chunk in iter(lambda: f.read(4096), b""):
                 hash_md5.update(chunk)
-        return hash_md5.hexdigest()
+                size += len(chunk)
+        return hash_md5.hexdigest(), size
     except FileNotFoundError:
-        return None
+        return None, None
 
 def get_file_timestamp(filepath):
     """Returns the last modified timestamp of a file in ISO 8601 format."""
@@ -111,13 +113,7 @@ def save_json(filepath, data):
     with open(filepath, 'w') as f:
         json.dump(data, f, indent=4)
 
-def connect_ftp(config):
-    ftp = FTP()
-    ftp.connect(config['host'], config.get('port', 21))
-    ftp.login(config['user'], config['password'])
-    return ftp
-
-def compare_with_ftp(ftp_config_path, file_data_list):
+def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
     """
     Compares local files (from hash file or git status) with remote FTP files.
     """
@@ -140,6 +136,7 @@ def compare_with_ftp(ftp_config_path, file_data_list):
             
             local_hash = item.get('hash', 'N/A')
             local_ts = item.get('timestamp', 'N/A')
+            local_size = item.get('size', None)
             
             # Check if file exists remotely and get basic info
             remote_size = None
@@ -150,17 +147,25 @@ def compare_with_ftp(ftp_config_path, file_data_list):
                 # Try to get size
                 remote_size = ftp.size(remote_path)
                 
+                # Check Size Only logic
+                if check_size_only:
+                    if local_size is not None and remote_size is not None:
+                        if local_size != remote_size:
+                            print(f"{rel_path:<40} | {'DIFF SIZE':<15} | Local: {local_size} vs Remote: {remote_size}")
+                        else:
+                            print(f"{rel_path:<40} | {'MATCH (Size)':<15} | Size: {local_size}")
+                    else:
+                         print(f"{rel_path:<40} | {'MISSING/UNK':<15} | Cannot compare size")
+                    
+                    # Skip hash check
+                    continue
+
                 # Try to get modification time (MDTM yyyyMMddHHmmss)
                 mdtm_resp = ftp.voidcmd(f"MDTM {remote_path}")
                 if mdtm_resp.startswith('213'):
                      remote_mtime = mdtm_resp.split()[1]
                 
-                # Download to check hash (expensive but requested)
-                # Using a temporary file or retrieving into memory if small enough
-                # For safety/simplicity let's verify if user really wants this. 
-                # The request said: "compares the hash and timestamps"
-                # So we must compute hash.
-                
+                # Check hash (Standard mode)
                 h_md5 = hashlib.md5()
                 def handle_binary(more_data):
                     h_md5.update(more_data)
@@ -196,6 +201,7 @@ def main():
     parser.add_argument("--vsHashFile", help="Path to existing hashfile to compare against.")
     parser.add_argument("--updateHashFile", help="Update existing hashfile with current git dirty files' hash/timestamp.")
     parser.add_argument("--ftpConfig", help="Path to FTP config JSON file.")
+    parser.add_argument("--checkSizeOnly", action="store_true", help="If set, only compares file sizes. Faster but less accurate regarding content equality (ignores line endings issues).")
 
     args = parser.parse_args()
     working_dir = os.path.abspath(args.workingDir)
@@ -217,11 +223,13 @@ def main():
             
             if file_content is not None:
                 file_hash = hashlib.md5(file_content).hexdigest()
+                file_size = len(file_content)
                 timestamp = get_git_file_timestamp(working_dir, rel_path)
                 
                 affected_files_data.append({
                     "path": rel_path,
                     "hash": file_hash,
+                    "size": file_size,
                     "timestamp": timestamp
                 })
             else:
@@ -256,13 +264,14 @@ def main():
         # Update map
         for rel_path in dirty_files:
             abs_path = os.path.join(working_dir, rel_path)
-            file_hash = calculate_file_hash(abs_path)
+            file_hash, file_size = calculate_file_hash_and_size(abs_path)
             timestamp = get_file_timestamp(abs_path)
             
             if file_hash:
                 existing_map[rel_path] = {
                     "path": rel_path,
                     "hash": file_hash,
+                    "size": file_size,
                     "timestamp": timestamp
                 }
         
@@ -278,7 +287,7 @@ def main():
     # FTP Comparison Step
     if args.ftpConfig: 
         if affected_files_data:
-            compare_with_ftp(args.ftpConfig, affected_files_data)
+            compare_with_ftp(args.ftpConfig, affected_files_data, check_size_only=args.checkSizeOnly)
         else:
             print("No file data to compare with FTP.")
 

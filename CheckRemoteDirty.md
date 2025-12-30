@@ -23,6 +23,7 @@ Run the script from the command line.
 | `--vsHashFile` | Path to an existing JSON file. Loads the list of files to check from this file. |
 | `--updateHashFile` | Path to an existing JSON file. specific uses existing file list but updates hashes/timestamps based on current local files. |
 | `--ftpConfig` | Path to the FTP configuration JSON file. If provided, performs the comparison against the remote server. |
+| `--checkSizeOnly` | **Optional**. If set, skip downloading/hashing files. Only compares file sizes. Faster, but ignores content changes if size remains identical (and ignores line-ending diffs). |
 
 ### Modes
 
