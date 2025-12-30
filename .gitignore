@@ -1,3 +1,6 @@
 
 # Ignore all json files (config and metadata)
 *.json
+__pycache__/
+*.pyc
+
