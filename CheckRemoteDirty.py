@@ -211,9 +211,13 @@ def main():
     parser = argparse.ArgumentParser(description="CheckStagingDirty: Check local git dirty state vs remote FTP.")
     
     parser.add_argument("--workingDir", required=True, help="Local project directory with git repo.")
-    parser.add_argument("--vsGit", help="Path to create/overwrite hashfile based on current git dirty files.")
-    parser.add_argument("--vsHashFile", help="Path to existing hashfile to compare against.")
-    parser.add_argument("--updateHashFile", help="Update existing hashfile with current git dirty files' hash/timestamp.")
+    
+    # Mode selection (Mutually Exclusive)
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument("--vsGit", help="Path to create/overwrite hashfile based on current git dirty files.")
+    mode_group.add_argument("--vsHashFile", help="Path to existing hashfile to compare against.")
+    mode_group.add_argument("--updateHashFile", help="Update existing hashfile with current git dirty files' hash/timestamp.")
+    
     parser.add_argument("--ftpConfig", help="Path to FTP config JSON file.")
     parser.add_argument("--checkSizeOnly", action="store_true", help="If set, only compares file sizes. Faster but less accurate regarding content equality (ignores line endings issues).")
 
@@ -296,10 +300,7 @@ def main():
         save_json(args.updateHashFile, affected_files_data)
         print(f"Updated hash file. Total records: {len(affected_files_data)}")
 
-    else:
-        print("Error: Must specify one of --vsGit, --vsHashFile, or --updateHashFile")
-        parser.print_help()
-        sys.exit(1)
+    # else: unreachable due to required mutually exclusive group
 
     # FTP Comparison Step
     if args.ftpConfig: 
