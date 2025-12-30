@@ -218,16 +218,16 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False):
 def main():
     parser = argparse.ArgumentParser(description="CheckStagingDirty: Check local git dirty state vs remote FTP.")
     
-    parser.add_argument("--workingDir", required=True, help="Local project directory with git repo.")
+    parser.add_argument("--workingDir", "--workingdir", required=True, dest="workingDir", help="Local project directory with git repo.")
     
     # Mode selection (Mutually Exclusive)
     mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument("--vsGit", help="Path to create/overwrite hashfile based on current git dirty files.")
-    mode_group.add_argument("--vsHashFile", help="Path to existing hashfile to compare against.")
-    mode_group.add_argument("--updateHashFile", help="Update existing hashfile with current git dirty files' hash/timestamp.")
+    mode_group.add_argument("--vsGit", "--vsgit", dest="vsGit", help="Path to create/overwrite hashfile based on current git dirty files.")
+    mode_group.add_argument("--vsHashFile", "--vshashfile", dest="vsHashFile", help="Path to existing hashfile to compare against.")
+    mode_group.add_argument("--updateHashFile", "--updatehashfile", dest="updateHashFile", help="Update existing hashfile with current git dirty files' hash/timestamp.")
     
-    parser.add_argument("--ftpConfig", help="Path to FTP config JSON file.")
-    parser.add_argument("--checkSizeOnly", action="store_true", help="If set, only compares file sizes. Faster but less accurate regarding content equality (ignores line endings issues).")
+    parser.add_argument("--ftpConfig", "--ftpconfig", dest="ftpConfig", help="Path to FTP config JSON file.")
+    parser.add_argument("--checkSizeOnly", "--checksizeonly", dest="checkSizeOnly", action="store_true", help="If set, only compares file sizes. Faster but less accurate regarding content equality (ignores line endings issues).")
 
     args = parser.parse_args()
     working_dir = os.path.abspath(args.workingDir)

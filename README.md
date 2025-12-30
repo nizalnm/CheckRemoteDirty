@@ -58,8 +58,10 @@ Run the script from the command line.
         *   **DIFF**: Upload failed or corruption occurred.
 
 ### Command Reference
-
-**Mode Flags** (Pick exactly one):
+ 
+ **Note**: All flag arguments are case-insensitive (e.g. `--ftpConfig`, `--ftpconfig`, and `--FTPCONFIG` are all valid).
+ 
+ **Mode Flags** (Pick exactly one):
 *   `--vsGit <file>`: Use Git HEAD as the source of truth (Safety Check).
 *   `--updateHashFile <file>`: Use Local Working Directory as source of truth (Verification).
 *   `--vsHashFile <file>`: Use a previously saved snapshot (Audit).
