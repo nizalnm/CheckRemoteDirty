@@ -230,6 +230,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                     status = "MATCH GIT"
                 elif last_deploy_hash and remote_hash == last_deploy_hash:
                     status = "MATCH LAST UPDATE"
+                    details += " (Safe to deploy, Remote matches your last deploy)"
                 else:
                     status = "DIFF HASH"
                     if local_size != remote_size:
