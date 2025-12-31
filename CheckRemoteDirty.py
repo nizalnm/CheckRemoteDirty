@@ -126,7 +126,7 @@ def connect_ftp(config):
     ftp.prot_p() # Secure data connection
     return ftp
 
-def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, deploy_on_clean=False, working_dir=None):
+def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, deploy_on_clean=False, working_dir=None, hash_file_path=None):
     """
     Compares local files (from hash file or git status) with remote FTP files.
     """
@@ -148,6 +148,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
         print("-" * (col_width + 15 + 30 + 6)) # Sum of widths + separators
 
         deployable_candidates = [] if deploy_on_clean else None
+        updates_to_save = False
 
         for item in file_data_list:
             rel_path = item['path'].replace('\\', '/')
@@ -220,10 +221,15 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                 details = ""
                 
                 # Dual Hash Comparison Logic
+                # Check for persistence (Last Deploy)
+                last_deploy_hash = item.get('my_remote', {}).get('hash')
+                
                 if remote_hash == local_hash:
                     status = "MATCH LOCAL"
                 elif remote_hash == git_hash:
-                    status = "MATCH GIT" 
+                    status = "MATCH GIT"
+                elif last_deploy_hash and remote_hash == last_deploy_hash:
+                    status = "MATCH LAST UPDATE"
                 else:
                     status = "DIFF HASH"
                     if local_size != remote_size:
@@ -257,16 +263,23 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                 
                 if status == "MATCH LOCAL":
                     print(f"Skipping {rel_path} (Already matches local)")
+                    # Auto-seed persistence if needed
+                    item['my_remote'] = {
+                        "hash": local_hash, 
+                        "timestamp": datetime.datetime.now().isoformat()
+                    }
+                    updates_to_save = True
                     continue
                 
                 if status == "DIFF HASH":
                     deployable = False
-                    print(f"WARNING: File {rel_path} differs from both HEAD and Local. Unknown remote state. Deployment unsafe.")
+                    print(f"WARNING: File {rel_path} differs from HEAD and Last Update. Unknown remote state. Deployment unsafe.")
                     deployable_candidates = None # Invalidate deployment
                     break 
 
-                if status in ["MATCH GIT", "MISSING"]:
+                if status in ["MATCH GIT", "MATCH LAST UPDATE", "MISSING"]:
                     deployable_candidates.append({
+                        "item_ref": item, # Reference to mutable item dict for updating my_remote
                         "rel_path": rel_path,
                         "remote_path": remote_path,
                         "status": status,
@@ -374,6 +387,13 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                         
                         if not verified:
                            failed_deploys.append(rel_path)
+                        else:
+                            # Update persistence data on success
+                            item['item_ref']['my_remote'] = {
+                                "hash": local_check_hash, 
+                                "timestamp": datetime.datetime.now().isoformat()
+                            }
+                            updates_to_save = True
 
                     except Exception as e:
                         print(f"\nError processing {rel_path}: {e}")
@@ -385,6 +405,22 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                         print(f" - {fp}")
                 else:
                     print("\nDeployment completed successfully.")
+                
+                # Save persistence update if changes occurred
+                if updates_to_save and hash_file_path:
+                    try:
+                        save_json(hash_file_path, file_data_list)
+                        print(f"Updated hashfile {hash_file_path} with new remote states.")
+                    except Exception as e:
+                         print(f"Warning: Failed to save updated hashfile: {e}")
+            
+            # Also save if we are just checking (no deploy flag) but found MATCH LOCAL updates
+            elif updates_to_save and hash_file_path:
+                try:
+                    save_json(hash_file_path, file_data_list)
+                    print(f"Updated persistence data in hashfile {hash_file_path}.")
+                except Exception as e:
+                     print(f"Warning: Failed to save updated hashfile: {e}")
 
             else:
                 print("Deployment cancelled by user.")
@@ -426,6 +462,10 @@ def main():
         print(f"Scanning for dirty files in {working_dir}...")
         dirty_files = get_git_dirty_files(working_dir)
         
+        # Load existing persistence data
+        existing_data = load_json(args.vsGit) or []
+        existing_map = {item['path']: item for item in existing_data}
+
         print(f"\n--- Local Dirty Files (HEAD) ---")
         for rel_path in dirty_files:
             # For vsGit mode, we fetch BOTH content/timestamp from HEAD and Local
@@ -453,14 +493,20 @@ def main():
 
             print(f"{rel_path:<50} | Git: {git_ts} | Local: {local_ts}")
             
-            affected_files_data.append({
+            item_data = {
                 "path": rel_path,
                 "git_hash": git_hash,
                 "git_ts": git_ts,
                 "local_hash": local_hash,
                 "local_size": local_size,
                 "local_ts": local_ts
-            })
+            }
+            
+            # Preserve persistence data (my_remote)
+            if rel_path in existing_map and 'my_remote' in existing_map[rel_path]:
+                item_data['my_remote'] = existing_map[rel_path]['my_remote']
+                
+            affected_files_data.append(item_data)
         
         save_json(args.vsGit, affected_files_data)
         print(f"\nSaved {len(affected_files_data)} dirty file records to {args.vsGit}")
@@ -520,7 +566,9 @@ def main():
     # FTP Comparison Step
     if args.ftpConfig: 
         if affected_files_data:
-            compare_with_ftp(args.ftpConfig, affected_files_data, check_size_only=args.checkSizeOnly, deploy_on_clean=args.deployOnClean, working_dir=working_dir)
+            # Determine which file to save updates to (vsGit or vsHashFile or updateHashFile)
+            hash_file_path = args.vsGit or args.vsHashFile or args.updateHashFile
+            compare_with_ftp(args.ftpConfig, affected_files_data, check_size_only=args.checkSizeOnly, deploy_on_clean=args.deployOnClean, working_dir=working_dir, hash_file_path=hash_file_path)
         else:
             print("No file data to compare with FTP.")
 

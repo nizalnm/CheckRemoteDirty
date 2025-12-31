@@ -21,7 +21,7 @@ Run the script from the command line.
 | `--workingDir` | **Required**. The local path to the project directory containing the Git repository. |
 | `--vsGit` | Path to a JSON file. Creates or overwrites this file with hashes from the current git **HEAD** commit for dirty files. Ignores local uncommitted changes. |
 | `--vsHashFile` | Path to an existing JSON file. Loads the list of files to check from this file. |
-| `--updateHashFile` | Path to an existing JSON file. specific uses existing file list but updates hashes/timestamps based on current local files. |
+| `--updateHashFile` | Path to an existing JSON file. Adds new dirty files from Git to the list and updates local hashes/timestamps for all items. Preserves local remote state history (`my_remote`). |
 | `--ftpConfig` | Path to the FTP configuration JSON file. If provided, performs the comparison against the remote server. |
 | `--checkSizeOnly` | **Optional**. If set, skip downloading/hashing files. Only compares file sizes. **Warning**: This mode is useless for cross-platform comparisons (e.g. Windows vs Linux) because line-endings (CRLF vs LF) cause size differences even if content matches. Use only if you are sure platforms match. |
 | `--deployOnClean` | **Optional**. If set, and if all remote files are found to be "clean" (matching the source of truth, e.g., git HEAD), prompts to deploy the local dirty files. |
@@ -93,7 +93,9 @@ Create a JSON file (e.g., `myconfig.json`) with your FTP credentials.
  
  The script outputs a table showing the status of each file:
 *   **MATCH**: Local hash matches remote hash. (Hashes are calculated after stripping `\r` and `\n` to ignore line-ending differences).
-*   **DIFF HASH**: Local content differs from remote content.
+*   **DIFF HASH**: Local content differs from remote content, AND remote content does not match the last-known deployed state.
+*   **MATCH LAST UPDATE**: Remote content differs from Git HEAD but matches the last version deployed by this script. This means the remote change was authorized/safe and can be overwritten by a newer local version.
+
 
 ## Quick Start Scripts
 
