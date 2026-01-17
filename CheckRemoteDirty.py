@@ -67,16 +67,16 @@ def get_git_dirty_files(working_dir):
         print("Error: 'git' command not found. Please ensure git is installed.")
         sys.exit(1)
 
-def get_git_file_content(repo_path, rel_path):
+def get_git_file_content(repo_path, rel_path, commit_ref="HEAD"):
     """
-    Returns the content of the file at rel_path from HEAD in the repo at repo_path.
-    Returns None if file is not in HEAD.
+    Returns the content of the file at rel_path from commit_ref (default HEAD) in the repo at repo_path.
+    Returns None if file is not in that commit.
     """
     try:
         # Use simple forward slashes for git pathspec
         git_path = rel_path.replace('\\', '/')
         result = subprocess.run(
-            ["git", "show", f"HEAD:{git_path}"],
+            ["git", "show", f"{commit_ref}:{git_path}"],
             cwd=repo_path,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -86,16 +86,16 @@ def get_git_file_content(repo_path, rel_path):
     except subprocess.CalledProcessError:
         return None
 
-def get_git_file_timestamp(repo_path, rel_path):
+def get_git_file_timestamp(repo_path, rel_path, commit_ref="HEAD"):
     """
-    Returns the commit timestamp of the file at rel_path from HEAD in ISO 8601 format.
-    Returns None if file is not in HEAD.
+    Returns the commit timestamp of the file at rel_path from commit_ref (default HEAD) in ISO 8601 format.
+    Returns None if file is not in that commit.
     """
     try:
         git_path = rel_path.replace('\\', '/')
         # -1 means last commit, %aI is ISO 8601 author date
         result = subprocess.run(
-            ["git", "log", "-1", "--format=%aI", "HEAD", "--", git_path],
+            ["git", "log", "-1", "--format=%aI", commit_ref, "--", git_path],
             cwd=repo_path,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -273,10 +273,48 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                     continue
                 
                 if status == "DIFF HASH":
-                    deployable = False
-                    print(f"WARNING: File {rel_path} differs from HEAD and Last Update. Unknown remote state. Deployment unsafe.")
-                    deployable_candidates = None # Invalidate deployment
-                    break 
+                    print(f"!! CONFLICT: {rel_path} differs from remote (DIFF HASH).")
+                    user_input = input(f"   Type 'replace' to overwrite remote, 'keep' to skip (backup remote), or Enter to abort: ").strip().lower()
+
+                    if user_input == 'replace':
+                        deployable_candidates.append({
+                            "item_ref": item,
+                            "rel_path": rel_path,
+                            "remote_path": remote_path,
+                            "status": "FORCE REPLACE",
+                            "local_path": os.path.join(working_dir, rel_path),
+                            "remote_mtime": remote_mtime,
+                            "remote_size": remote_size
+                        })
+                        print(f"   >> Marked for REPLACEMENT (Remote will be backed up during deployment).")
+
+                    elif user_input == 'keep':
+                        # Backup remote file for manual merging / safety since we're not deploying over it
+                        try:
+                            script_dir = os.path.dirname(os.path.abspath(__file__))
+                            project_name = os.path.basename(working_dir)
+                            backup_dir = os.path.join(script_dir, "backups", project_name)
+                            backup_file_dir = os.path.join(backup_dir, os.path.dirname(rel_path))
+                            os.makedirs(backup_file_dir, exist_ok=True)
+                            
+                            ts_suffix = remote_mtime.replace(':', '').replace(' ', '_').replace('-', '') if remote_mtime else datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                            backup_filename = f"{os.path.basename(rel_path)}.{ts_suffix}.conflict_bk"
+                            backup_full_path = os.path.join(backup_file_dir, backup_filename)
+                            
+                            print(f"   >> Downloading backup to {backup_full_path} ...", end=" ")
+                            with open(backup_full_path, 'wb') as f_bk:
+                                ftp.retrbinary(f"RETR {remote_path}", f_bk.write)
+                            print("Done.")
+                        except Exception as e:
+                            print(f"\n   >> Backup failed: {e}")
+                            print("   >> Warning: proceeded with 'keep' but failed to download backup.")
+
+                        print(f"   >> Skipped (Remote kept unchanged).")
+
+                    else:
+                        print("   >> Aborting deployment.")
+                        deployable_candidates = None # Invalidate deployment
+                        break 
 
                 if status in ["MATCH GIT", "MATCH LAST UPDATE", "MISSING"]:
                     deployable_candidates.append({
@@ -301,7 +339,6 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
             print(f"\nAll {len(deployable_candidates)} remote files are clean (match HEAD or missing).")
             response = input("Proceed with deployment? (Y/n): ").strip()
             if response in ['Y', 'y', '']:
-                print("\nStarting deployment...")
                 print("\nStarting deployment...")
                 script_dir = os.path.dirname(os.path.abspath(__file__))
                 project_name = os.path.basename(working_dir)
@@ -448,6 +485,7 @@ def main():
     parser.add_argument("--ftpConfig", "--ftpconfig", dest="ftpConfig", help="Path to FTP config JSON file.")
     parser.add_argument("--checkSizeOnly", "--checksizeonly", dest="checkSizeOnly", action="store_true", help="If set, only compares file sizes. Faster but less accurate regarding content equality (ignores line endings issues).")
     parser.add_argument("--deployOnClean", "--deployonclean", dest="deployOnClean", action="store_true", help="If set, attempts to deploy files if remote is clean (matches Git HEAD or missing).")
+    parser.add_argument("--gitCommitHash", "--gitcommithash", dest="gitCommitHash", help="Optional. The git commit hash (or ref) to compare against. Defaults to 'HEAD'.")
 
     args = parser.parse_args()
     working_dir = os.path.abspath(args.workingDir)
@@ -471,15 +509,16 @@ def main():
         for rel_path in dirty_files:
             # For vsGit mode, we fetch BOTH content/timestamp from HEAD and Local
             
-            # 1. GIT INFO (HEAD)
-            git_content = get_git_file_content(working_dir, rel_path)
+            # 1. GIT INFO (HEAD or Commit Hash)
+            commit_ref = args.gitCommitHash if args.gitCommitHash else "HEAD"
+            git_content = get_git_file_content(working_dir, rel_path, commit_ref)
             git_hash = "N/A"
             git_ts = "N/A"
             
             if git_content is not None:
                 norm_git_content = git_content.replace(b'\r', b'').replace(b'\n', b'')
                 git_hash = hashlib.md5(norm_git_content).hexdigest()
-                git_ts = get_git_file_timestamp(working_dir, rel_path)
+                git_ts = get_git_file_timestamp(working_dir, rel_path, commit_ref)
             
             # 2. LOCAL INFO (Working Dir)
             abs_path = os.path.join(working_dir, rel_path)
