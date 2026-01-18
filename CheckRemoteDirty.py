@@ -106,6 +106,34 @@ def get_git_file_timestamp(repo_path, rel_path, commit_ref="HEAD"):
     except subprocess.CalledProcessError:
         return None
 
+def get_files_changed_in_commit(repo_path, commit_hash):
+    """
+    Returns a list of files that were changed (added/modified) in the specified commit_hash.
+    """
+    try:
+        # Use diff-tree to find changed files in the commit
+        # -r: recurse into subtrees
+        # --no-commit-id: suppress commit ID output
+        # --name-only: show only names of changed files
+        result = subprocess.run(
+            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit_hash],
+            cwd=repo_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+        
+        files = []
+        for line in result.stdout.splitlines():
+            if line.strip():
+                # Handle quoting if present
+                files.append(line.strip().strip('"'))
+        return files
+    except subprocess.CalledProcessError as e:
+        print(f"Error getting files from commit {commit_hash}: {e.stderr}")
+        return []
+
 def load_json(filepath):
     if not os.path.exists(filepath):
         return None
@@ -500,6 +528,25 @@ def main():
     if args.vsGit:
         print(f"Scanning for dirty files in {working_dir}...")
         dirty_files = get_git_dirty_files(working_dir)
+        
+        # If a specific commit hash is provided, also include changed files from that commit
+        if args.gitCommitHash:
+            print(f"Scanning for files changed in commit {args.gitCommitHash}...")
+            commit_files = get_files_changed_in_commit(working_dir, args.gitCommitHash)
+            
+            # Add unique files to the list
+            existing_files = set(dirty_files)
+            added_count = 0
+            for f in commit_files:
+                if f not in existing_files:
+                    dirty_files.append(f)
+                    existing_files.add(f)
+                    added_count += 1
+            
+            if added_count > 0:
+                print(f"Added {added_count} files from commit {args.gitCommitHash}.")
+            elif not dirty_files:
+                print(f"No changed files found in commit {args.gitCommitHash}.")
         
         # Load existing persistence data
         existing_data = load_json(args.vsGit) or []

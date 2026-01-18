@@ -19,13 +19,13 @@ Run the script from the command line.
 | Argument | Description |
 | :--- | :--- |
 | `--workingDir` | **Required**. The local path to the project directory containing the Git repository. |
-| `--vsGit` | Path to a JSON file. Creates or overwrites this file with hashes from the current git **HEAD** commit for dirty files (unless `--gitCommitHash` is provided, see below). Ignores local uncommitted changes. |
+| `--vsGit` | Path to a JSON file. Creates or overwrites this file with hashes from the current git **HEAD**, checking currently dirty files. If `--gitCommitHash` is provided, it **ALSO** checks all files changed in that specific commit (even if they are clean locally). |
 | `--vsHashFile` | Path to an existing JSON file. Loads the list of files to check from this file. |
 | `--updateHashFile` | Path to an existing JSON file. Adds new dirty files from Git to the list and updates local hashes/timestamps for all items. Preserves local remote state history (`my_remote`). |
 | `--ftpConfig` | Path to the FTP configuration JSON file. If provided, performs the comparison against the remote server. |
 | `--checkSizeOnly` | **Optional**. If set, skip downloading/hashing files. Only compares file sizes. **Warning**: This mode is useless for cross-platform comparisons (e.g. Windows vs Linux) because line-endings (CRLF vs LF) cause size differences even if content matches. Use only if you are sure platforms match. |
 | `--deployOnClean` | **Optional**. If set, and if all remote files are found to be "clean" (matching the source of truth, e.g., git HEAD/commit version), prompts to deploy the local dirty files. |
-| `--gitCommitHash` | **Optional**. Specify a git commit hash (or ref like `HEAD~1`) to use as the "clean" source of truth instead of `HEAD`. Useful if you want to verify against a specific historical version. |
+| `--gitCommitHash` | **Optional**. Specify a git commit hash (or ref like `HEAD~1`) to use as the "clean" source of truth instead of `HEAD`. In `--vsGit` mode, this **automatically adds** all files changed in that commit to the check list, allowing you to verify a specific historical deployment even on a clean repo. |
 
 ### Common Workflows
 
@@ -43,6 +43,20 @@ Run the script from the command line.
     4.  **Result**:
         *   **MATCH**: Remote is clean (synced with HEAD/commit version). Safe to deploy your changes.
         *   **DIFF**: Remote has unknown changes! **Do not deploy as is** or you will overwrite them. Instead perform the tender loving care of merging the remote changes carefully into your local, before deploying (and committing the merged changes like the good chap you are).
+
+#### 2. "Verify Past Deployment" (Clean Repo)
+**Goal**: You have already committed and deployed your changes. Your git status is clean. You want to double-check that the files modified in that specific commit were actually updated on the server.
+
+*   **Command**:
+    ```bash
+    python CheckRemoteDirty.py --workingDir "." --vsGit "check.json" --ftpConfig "ftp.json" --gitCommitHash "20043ac..."
+    ```
+*   **Logic**:
+    1.  Detects that you provided a commit hash.
+    2.  Identifies all files changed in that commit (even though your repo is clean).
+    3.  Fetches content from that specific commit context.
+    4.  Compares against Remote.
+    5.  **Result**: MATCH confirms that the specific version is live.
 
 #### 2. "Post-Deploy" Verification
 **Goal**: You just deployed your local dirty files. You want to verify they were uploaded correctly and match your local disk.
