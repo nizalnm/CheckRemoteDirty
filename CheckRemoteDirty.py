@@ -144,6 +144,59 @@ def save_json(filepath, data):
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=4)
 
+def ensure_remote_dirs(ftp, remote_file_path):
+    """
+    Recursively ensures that the directory hierarchy for remote_file_path exists.
+    """
+    directory = os.path.dirname(remote_file_path)
+    if not directory or directory == '.':
+        return
+
+    # Normalize path separators
+    directory = directory.replace('\\', '/')
+    parts = directory.split('/')
+    
+    # Save current directory
+    try:
+        original_pwd = ftp.pwd()
+    except ftplib.error_perm:
+        # Fallback if PWD fails? Should not happen on standard FTP.
+        original_pwd = '/' 
+
+    try:
+        # If absolute path, start from root
+        if remote_file_path.startswith('/'):
+            ftp.cwd('/')
+        
+        for part in parts:
+            if not part: continue # Empty part from leading slash or double slashes
+            
+            try:
+                ftp.cwd(part)
+            except ftplib.error_perm:
+                # Directory probably doesn't exist, try to create it
+                try:
+                    ftp.mkd(part)
+                    ftp.cwd(part)
+                    print(f"[MkDir: {part}]", end=" ") # Feedback
+                except ftplib.error_perm as e:
+                    # Could be permission invalid or already exists but CWD failed?
+                    # Retrying CWD one last time?
+                    try:
+                        ftp.cwd(part)
+                    except:
+                        raise Exception(f"Could not create/enter directory: {part} ({e})")
+
+    except Exception as e:
+        print(f"Error ensuring remote directories: {e}", end=" ")
+        # We don't exit, we let storbinary try and fail if it must
+    finally:
+        try:
+            ftp.cwd(original_pwd)
+        except:
+            pass
+
+
 def connect_ftp(config):
     """
     Connects to FTP server using config.
@@ -177,6 +230,18 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
 
         deployable_candidates = [] if deploy_on_clean else None
         updates_to_save = False
+        
+        counts = {
+            "MATCH LOCAL": 0,
+            "MATCH GIT": 0,
+            "MATCH LAST UPDATE": 0,
+            "DIFF HASH": 0,
+            "MISSING": 0,
+            "DIFF SIZE": 0,
+            "MATCH (Size)": 0,
+            "MISSING/UNK": 0
+        }
+
 
         for item in file_data_list:
             rel_path = item['path'].replace('\\', '/')
@@ -279,6 +344,13 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                 remote_hash = "N/A"
 
             print(f"{rel_path:<{col_width}} | {status:<15} | {details}")
+            
+            # Update counts
+            if status in counts:
+                counts[status] += 1
+            else:
+                # Handle unexpected statuses or grouping
+                counts[status] = counts.get(status, 0) + 1
 
             # Collect candidates for deployment
             if deploy_on_clean:
@@ -357,6 +429,14 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
         
         # End of comparison loop
         
+        print("-" * (col_width + 15 + 30 + 6))
+        print("Summary:")
+        total_files = len(file_data_list)
+        for stat, count in counts.items():
+            if count > 0:
+                print(f"  {stat:<20}: {count}/{total_files}")
+
+        
         if deploy_on_clean and deployable_candidates is not None:
             # All checks passed
             if not deployable_candidates:
@@ -406,6 +486,10 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
 
                         # 2. Upload
                         print(f"Uploading {rel_path} ...", end=" ")
+                        
+                        # Ensure directories exist
+                        ensure_remote_dirs(ftp, remote_path)
+                        
                         with open(local_path, 'rb') as f_up:
                             ftp.storbinary(f"STOR {remote_path}", f_up)
 
