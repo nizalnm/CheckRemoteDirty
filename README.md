@@ -31,19 +31,19 @@ Run the script from the command line.
 
 ### Advanced Argument Interactions
 
-You can mix and match these arguments to control *Scope* (What to check), *Reference* (What is safe), and *Payload* (What to deploy).
+You can mix and match these arguments to control *Scope* (What to check), *Standard Reference* (Phase 1 Benchmark), and *Extra Safety* (Phase 2 Baselines).
 
-| Scenario | Scope (List of Files) | Reference A (Safe if Matches) | Reference B (Safe if Matches) | Payload (What is Uploaded) |
+| Scenario | Scope (List of Files) | Standard Hash (Ref A) | Additional Baselines (Ref B) | Default Payload |
 | :--- | :--- | :--- | :--- | :--- |
-| **Default** (No Hashes) | `git status` (Local Dirty) | `HEAD` | None | Local Disk File |
-| **`--gitCommitHash` only** | Changed files in `Hash` | `Hash` | None | Local Disk File |
-| **`--gitBaselineHash` only** | `git status` (Local Dirty) | `HEAD` | `Baseline` | Local Disk File |
-| **All 3 Hashes** | Changed files in `ListHash` | `CommitHash` | `Baseline` | Local Disk File |
-| **Git Version** | Any | `CommitHash` | `Baseline` | Git Blob (Temp) |
+| **Default** (Local Sync) | `git status` (Local Dirty) | `HEAD` | history (`my_remote`) | Local Disk File |
+| **Deploy Commit** | Changed in `CommitHash` | `CommitHash` | `CommitHash` + history | Local Disk File |
+| **Sync Check** | `git status` (Local Dirty) | `HEAD` | `Baseline` + history | Local Disk File |
+| **Full Safety Audit** | Changed in `ListHash` | `CommitHash` | `Baseline` + history | Local Disk File |
 
-**Key Takeaway**:
-*   The script **DEFAULTED** to deploying the file currently on your local disk.
-*   The arguments provide "Safety Checks" (References) to ensure you aren't overwriting unknown server changes.
+**Terminology Clarification**:
+*   **Standard Hash (Ref A)**: The "Source of Truth" (clean version). If local disk differs from this, Phase 1 flags a mismatch.
+*   **Safety Baselines (Ref B)**: Known safe states for the remote server. If the remote file matches *any* of these, it's considered unmodified/outdated and safe to overwrite. By default, the `Standard Hash` is always included as a baseline.
+*   **Default Payload**: The script always defaults to uploading your **Local Disk File**. You can switch to the **Git Blob** during the Phase 1 decision prompt.
 
 ---
 
