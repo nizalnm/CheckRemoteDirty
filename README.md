@@ -25,7 +25,25 @@ Run the script from the command line.
 | `--ftpConfig` | Path to the FTP configuration JSON file. If provided, performs the comparison against the remote server. |
 | `--checkSizeOnly` | **Optional**. If set, skip downloading/hashing files. Only compares file sizes. **Warning**: This mode is useless for cross-platform comparisons (e.g. Windows vs Linux) because line-endings (CRLF vs LF) cause size differences even if content matches. Use only if you are sure platforms match. |
 | `--deployOnClean` | **Optional**. If set, and if all remote files are found to be "clean" (matching the source of truth, e.g., git HEAD/commit version), prompts to deploy the local dirty files. |
-| `--gitCommitHash` | **Optional**. Specify a git commit hash (or ref like `HEAD~1`) to use as the "clean" source of truth instead of `HEAD`. In `--vsGit` mode, this **automatically adds** all files changed in that commit to the check list, allowing you to verify a specific historical deployment even on a clean repo. |
+| `--gitCommitHash` | **Optional**. Specify a git commit hash (or ref like `HEAD~1`) to use as the "clean" source of truth instead of `HEAD`. In `--vsGit` mode (without `--vsGitListHash`), this **automatically adds** all files changed in that commit to the check list, allowing you to verify a specific historical deployment even on a clean repo. |
+| `--vsGitListHash` | **Optional**. Specify a second git commit hash to derive the **list of files** to be checked. If provided, the reference content hashes are still derived from `--gitCommitHash` (or `HEAD`), but the scope is limited to files in this specific commit. |
+| `--gitBaselineHash` | **Optional**. Specify a git commit hash to use as the "expected" remote state. If a remote file differs from your local/HEAD version but **matches** this baseline commit, it is considered safe to overwrite (as the remote is simply outdated, not modified). Ignored if `--checkSizeOnly` is used. |
+
+### Advanced Argument Interactions
+
+You can mix and match these arguments to control *Scope* (What to check), *Reference* (What is safe), and *Payload* (What to deploy).
+
+| Scenario | Scope (List of Files) | Reference A (Safe if Matches) | Reference B (Safe if Matches) | Payload (What is Uploaded) |
+| :--- | :--- | :--- | :--- | :--- |
+| **Default** (No Hashes) | `git status` (Local Dirty) | `HEAD` | None | Local Disk File |
+| **`--gitCommitHash` only** | Changed files in `Hash` | `Hash` | None | Local Disk File |
+| **`--gitBaselineHash` only** | `git status` (Local Dirty) | `HEAD` | `Baseline` | Local Disk File |
+| **All 3 Hashes** | Changed files in `ListHash` | `CommitHash` | `Baseline` | Local Disk File |
+
+**Key Takeaway**:
+*   The script **ALWAYS** deploys the file currently on your local disk.
+*   The arguments simply provide different "Safety Checks" (References) to ensure you aren't overwriting unknown server changes.
+*   If a remote file matches **ANY** provided Reference (HEAD, CommitHash, or Baseline), it is considered "Clean" and safe to overwrite.
 
 ### Common Workflows
 
@@ -44,21 +62,25 @@ Run the script from the command line.
         *   **MATCH**: Remote is clean (synced with HEAD/commit version). Safe to deploy your changes.
         *   **DIFF**: Remote has unknown changes! **Do not deploy as is** or you will overwrite them. Instead perform the tender loving care of merging the remote changes carefully into your local, before deploying (and committing the merged changes like the good chap you are).
 
-#### 2. "Verify Past Deployment" (Clean Repo)
-**Goal**: You have already committed and deployed your changes. Your git status is clean. You want to double-check that the files modified in that specific commit were actually updated on the server.
+
+#### 2. "Verify Past Deployment" (Specific Commit) w/ Safety Check
+**Goal**: You want to deploy/verify a specific commit, but you also want to be sure your local files actually match that commit before uploading (to avoid accidentally uploading uncommitted local changes).
 
 *   **Command**:
     ```bash
     python CheckRemoteDirty.py --workingDir "." --vsGit "check.json" --ftpConfig "ftp.json" --gitCommitHash "20043ac..."
     ```
 *   **Logic**:
-    1.  Detects that you provided a commit hash.
-    2.  Identifies all files changed in that commit (even though your repo is clean).
-    3.  Fetches content from that specific commit context.
-    4.  Compares against Remote.
-    5.  **Result**: MATCH confirms that the specific version is live.
+    1.  Identifies files changed in `20043ac...`.
+    2.  Compares `Local File` vs `Git Commit Version`.
+    3.  **Safety Interlock**:
+        *   If `Local != Git`: Pauses and warns you.
+        *   **[L] Use Local**: Ignores mismatch, uploads your local file.
+        *   **[G] Use Git**: Extracts the clean file from git commit (memory) and uploads it, **ignoring** your local changes.
+    4.  Compares `Chosen Source` vs `Remote`.
+    5.  **Result**: Proceed execution if clean.
 
-#### 2. "Post-Deploy" Verification
+#### 3. "Post-Deploy" Verification
 **Goal**: You just deployed your local dirty files. You want to verify they were uploaded correctly and match your local disk.
 
 *   **Command**:
@@ -154,3 +176,13 @@ Sample batch (`.bat`) and shell (`.sh`) scripts are provided to help you get sta
 *   **Deploy** (`deploy`): Runs the safety check, and if safe, backs up remote files and deploys your local changes.
 *   **Post-Deploy** (`postdeploy`): Verifies that the files currently on the server match your local files. Use this after deployment to ensure integrity.
 
+
+### Bonus Helper: `diff_normalized.py`
+
+A standalone utility to compare two files (or a file vs git) while **ignoring line endings (`\r\n` vs `\n`)**. Correctly handles Windows vs Linux line ending differences that often appear as false positives in standard diff tools.
+
+**Usage**:
+```bash
+python diff_normalized.py file1.php file2.php
+python diff_normalized.py file.php --vsGit HEAD
+```

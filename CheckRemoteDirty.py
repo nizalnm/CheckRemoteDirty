@@ -7,7 +7,18 @@ import json
 import ftplib
 import datetime
 import sys
+import io
 from ftplib import FTP_TLS
+
+class Colors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 def calculate_file_hash_and_size(filepath):
     """Calculates normalized MD5 hash (no CRLF) and raw size of a file."""
@@ -116,7 +127,7 @@ def get_files_changed_in_commit(repo_path, commit_hash):
         # --no-commit-id: suppress commit ID output
         # --name-only: show only names of changed files
         result = subprocess.run(
-            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", commit_hash],
+            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", commit_hash],
             cwd=repo_path,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -207,7 +218,7 @@ def connect_ftp(config):
     ftp.prot_p() # Secure data connection
     return ftp
 
-def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, deploy_on_clean=False, working_dir=None, hash_file_path=None):
+def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, deploy_on_clean=False, working_dir=None, hash_file_path=None, baseline_hash_ref=None):
     """
     Compares local files (from hash file or git status) with remote FTP files.
     """
@@ -325,7 +336,22 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                     status = "MATCH LAST UPDATE"
                     details += " (Safe to deploy, Remote matches your last deploy)"
                 else:
-                    status = "DIFF HASH"
+                    # Check Baseline if provided
+                    is_baseline_match = False
+                    if baseline_hash_ref:
+                        baseline_content = get_git_file_content(working_dir, rel_path, baseline_hash_ref)
+                        if baseline_content is not None:
+                             # Normalize
+                             norm_base = baseline_content.replace(b'\r', b'').replace(b'\n', b'')
+                             baseline_md5 = hashlib.md5(norm_base).hexdigest()
+                             if remote_hash == baseline_md5:
+                                 is_baseline_match = True
+                    
+                    if is_baseline_match:
+                        status = "MATCH BASELINE"
+                        details += " (Safe, matches baseline commit)"
+                    else:
+                        status = "DIFF HASH"
                     if local_size != remote_size:
                          # Likely Line Endings if strictly hashing but size diff, 
                          # but here we normalized, so it's a genuine content match/diff.
@@ -416,7 +442,17 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                         deployable_candidates = None # Invalidate deployment
                         break 
 
-                if status in ["MATCH GIT", "MATCH LAST UPDATE", "MISSING"]:
+                if status in ["MATCH GIT", "MATCH LAST UPDATE", "MATCH BASELINE", "MISSING"]:
+                    # Check for LOCAL <> GIT mismatches (Safety Check)
+                    is_local_git_mismatch = False
+                    git_hash = item.get('git_hash')
+                    local_hash = item.get('local_hash')
+                    commit_ref = item.get('commit_ref', "HEAD") # Default if missing
+                    
+                    # Only flag mismatch if git_hash is valid (not N/A) and differs from local
+                    if git_hash and git_hash != "N/A" and local_hash and local_hash != git_hash:
+                         is_local_git_mismatch = True
+
                     deployable_candidates.append({
                         "item_ref": item, # Reference to mutable item dict for updating my_remote
                         "rel_path": rel_path,
@@ -424,7 +460,11 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                         "status": status,
                         "local_path": os.path.join(working_dir, rel_path),
                         "remote_mtime": remote_mtime, # for backup suffix
-                        "remote_size": remote_size
+                        "remote_size": remote_size,
+                        "local_git_mismatch": is_local_git_mismatch,
+                        "git_hash": git_hash,
+                        "local_hash": local_hash,
+                        "commit_ref": commit_ref 
                     })
         
         # End of comparison loop
@@ -490,10 +530,24 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                         # Ensure directories exist
                         ensure_remote_dirs(ftp, remote_path)
                         
-                        with open(local_path, 'rb') as f_up:
-                            ftp.storbinary(f"STOR {remote_path}", f_up)
-
-                        print("Done.")
+                        if item.get('use_git_content'):
+                             # Use Git Content (In-Memory)
+                             commit_ref = item.get('commit_ref', 'HEAD')
+                             try:
+                                 git_content = get_git_file_content(working_dir, rel_path, commit_ref)
+                                 if git_content is None:
+                                     raise Exception(f"Content retrieval returned None for {rel_path}@{commit_ref}")
+                                 
+                                 f_up = io.BytesIO(git_content)
+                                 ftp.storbinary(f"STOR {remote_path}", f_up)
+                                 print(f"Done (from {commit_ref}).")
+                             except Exception as e:
+                                 print(f"Error retrieving/uploading git content: {e}")
+                                 raise e
+                        else:
+                             with open(local_path, 'rb') as f_up:
+                                 ftp.storbinary(f"STOR {remote_path}", f_up)
+                             print("Done.")
                         
                         # 3. Verification & Retry
                         max_retries = 3
@@ -598,6 +652,8 @@ def main():
     parser.add_argument("--checkSizeOnly", "--checksizeonly", dest="checkSizeOnly", action="store_true", help="If set, only compares file sizes. Faster but less accurate regarding content equality (ignores line endings issues).")
     parser.add_argument("--deployOnClean", "--deployonclean", dest="deployOnClean", action="store_true", help="If set, attempts to deploy files if remote is clean (matches Git HEAD or missing).")
     parser.add_argument("--gitCommitHash", "--gitcommithash", dest="gitCommitHash", help="Optional. The git commit hash (or ref) to compare against. Defaults to 'HEAD'.")
+    parser.add_argument("--vsGitListHash", "--vsgitlisthash", dest="vsGitListHash", help="Optional. A second git commit hash to derive the list of files to be checked. If provided, the reference content will still be pulled from --gitCommitHash (or HEAD).")
+    parser.add_argument("--gitBaselineHash", "--gitbaselinehash", dest="gitBaselineHash", help="Optional. Treat this git commit as the 'expected' state of the remote server. If a remote file matches this version, it is considered safe to overwrite (changes are clean).")
 
     args = parser.parse_args()
     working_dir = os.path.abspath(args.workingDir)
@@ -610,27 +666,31 @@ def main():
 
     # MODE: vsGit
     if args.vsGit:
-        print(f"Scanning for dirty files in {working_dir}...")
-        dirty_files = get_git_dirty_files(working_dir)
-        
-        # If a specific commit hash is provided, also include changed files from that commit
-        if args.gitCommitHash:
-            print(f"Scanning for files changed in commit {args.gitCommitHash}...")
-            commit_files = get_files_changed_in_commit(working_dir, args.gitCommitHash)
+        if args.vsGitListHash:
+            print(f"Scanning for files changed in commit {args.vsGitListHash}...")
+            dirty_files = get_files_changed_in_commit(working_dir, args.vsGitListHash)
+        else:
+            print(f"Scanning for dirty files in {working_dir}...")
+            dirty_files = get_git_dirty_files(working_dir)
             
-            # Add unique files to the list
-            existing_files = set(dirty_files)
-            added_count = 0
-            for f in commit_files:
-                if f not in existing_files:
-                    dirty_files.append(f)
-                    existing_files.add(f)
-                    added_count += 1
-            
-            if added_count > 0:
-                print(f"Added {added_count} files from commit {args.gitCommitHash}.")
-            elif not dirty_files:
-                print(f"No changed files found in commit {args.gitCommitHash}.")
+            # If a specific commit hash is provided, also include changed files from that commit
+            if args.gitCommitHash:
+                print(f"Scanning for files changed in commit {args.gitCommitHash}...")
+                commit_files = get_files_changed_in_commit(working_dir, args.gitCommitHash)
+                
+                # Add unique files to the list
+                existing_files = set(dirty_files)
+                added_count = 0
+                for f in commit_files:
+                    if f not in existing_files:
+                        dirty_files.append(f)
+                        existing_files.add(f)
+                        added_count += 1
+                
+                if added_count > 0:
+                    print(f"Added {added_count} files from commit {args.gitCommitHash}.")
+                elif not dirty_files:
+                    print(f"No changed files found in commit {args.gitCommitHash}.")
         
         # Load existing persistence data
         existing_data = load_json(args.vsGit) or []
@@ -670,7 +730,8 @@ def main():
                 "git_ts": git_ts,
                 "local_hash": local_hash,
                 "local_size": local_size,
-                "local_ts": local_ts
+                "local_ts": local_ts,
+                "commit_ref": commit_ref
             }
             
             # Preserve persistence data (my_remote)
@@ -739,7 +800,7 @@ def main():
         if affected_files_data:
             # Determine which file to save updates to (vsGit or vsHashFile or updateHashFile)
             hash_file_path = args.vsGit or args.vsHashFile or args.updateHashFile
-            compare_with_ftp(args.ftpConfig, affected_files_data, check_size_only=args.checkSizeOnly, deploy_on_clean=args.deployOnClean, working_dir=working_dir, hash_file_path=hash_file_path)
+            compare_with_ftp(args.ftpConfig, affected_files_data, check_size_only=args.checkSizeOnly, deploy_on_clean=args.deployOnClean, working_dir=working_dir, hash_file_path=hash_file_path, baseline_hash_ref=args.gitBaselineHash)
         else:
             print("No file data to compare with FTP.")
 
