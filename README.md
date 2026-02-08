@@ -39,17 +39,53 @@ You can mix and match these arguments to control *Scope* (What to check), *Refer
 | **`--gitCommitHash` only** | Changed files in `Hash` | `Hash` | None | Local Disk File |
 | **`--gitBaselineHash` only** | `git status` (Local Dirty) | `HEAD` | `Baseline` | Local Disk File |
 | **All 3 Hashes** | Changed files in `ListHash` | `CommitHash` | `Baseline` | Local Disk File |
+| **Git Version** | Any | `CommitHash` | `Baseline` | Git Blob (Temp) |
 
 **Key Takeaway**:
-*   The script **ALWAYS** deploys the file currently on your local disk.
-*   The arguments simply provide different "Safety Checks" (References) to ensure you aren't overwriting unknown server changes.
-*   If a remote file matches **ANY** provided Reference (HEAD, CommitHash, or Baseline), it is considered "Clean" and safe to overwrite.
+*   The script **DEFAULTED** to deploying the file currently on your local disk.
+*   The arguments provide "Safety Checks" (References) to ensure you aren't overwriting unknown server changes.
+
+---
+
+## The Two-Phase Safety Check
+
+To prevent accidental deployments of unfinalized work or merge patches, `CheckRemoteDirty` enforces a two-stage verification process:
+
+### Phase 1: Local Integrity Check (Pre-FTP)
+Before connecting to the remote server, the script compares your **Local Disk Files** against the **Git source of truth** (`HEAD` or `--gitCommitHash`).
+
+If mismatches are found (e.g., uncommitted changes or merge patches), the script pauses for a decision.
+
+**Bulk Decisions**:
+If multiple files are mismatched, you will first be prompted for a bulk action:
+*   **[U]se Local for ALL**: Apply "Use Local" to all mismatched files.
+*   **[G]it Version (Temp) for ALL**: Fetch the Git version for all mismatched files.
+*   **[I]ndividual**: Resolve each mismatch one-by-one (see below).
+*   **[A]bort**: Stop the entire process.
+
+**Individual Options**:
+1.  **[U]se Local**: Treat your current local version (likely with uncommitted patches) as the intended goal for this deployment.
+2.  **[G]it Version (Temp)**: **SAFE.** The script will fetch the original content from Git into a **temporary file** for deployment. **Your local disk file remains completely untouched.**
+3.  **[A]bort**: Stop the process.
+
+The script then displays a summary of your choices:
+> `Deployment Goals: 15 files (3 diff local vs git, using local)`
+
+### Phase 2: Remote Comparison (Local/Git vs Remote)
+Once the local state is finalized, the script connects to the FTP server and compares your **Chosen Goal** (either Local Disk or Git-Temp) against the **Remote File**.
+
+| Status | Meaning |
+| :--- | :--- |
+| **`MATCH GOAL`** | Remote matches your chosen target (Local Disk or Git-Temp). Already synced! |
+| **`MATCH BASELINE`** | Remote matches a baseline (unmodified Git commit, previous baseline, or last deploy). Safe to overwrite. |
+| **`DIFF HASH`** | Remote matches **NEITHER** your goal nor any baseline. Potential unknown change found! |
+
+---
 
 ### Common Workflows
 
 #### 1. "Pre-Flight" Safety Check (Recommended)
 **Goal**: You have local dirty changes you want to manually deploy, yet you feel it is too insignificant to git-commit first *(Hold the pitchforks o CI/CD crusaders! I am but a wee bit of a web developer)*. You want to ensure the specific files you are about to overwrite on the server have not been modified by someone else (i.e., ensure Remote == Git HEAD/commit version).
-
 *   **Command**:
     ```bash
     python CheckRemoteDirty.py --workingDir "." --vsGit "dirty.json" --ftpConfig "ftp.json"
@@ -63,7 +99,7 @@ You can mix and match these arguments to control *Scope* (What to check), *Refer
         *   **DIFF**: Remote has unknown changes! **Do not deploy as is** or you will overwrite them. Instead perform the tender loving care of merging the remote changes carefully into your local, before deploying (and committing the merged changes like the good chap you are).
 
 
-#### 2. "Verify Past Deployment" (Specific Commit) w/ Safety Check
+#### 2. "Verify Past Deployment" (Specific Commit) with Safety Check
 **Goal**: You want to deploy/verify a specific commit, but you also want to be sure your local files actually match that commit before uploading (to avoid accidentally uploading uncommitted local changes).
 
 *   **Command**:
@@ -74,9 +110,9 @@ You can mix and match these arguments to control *Scope* (What to check), *Refer
     1.  Identifies files changed in `20043ac...`.
     2.  Compares `Local File` vs `Git Commit Version`.
     3.  **Safety Interlock**:
-        *   If `Local != Git`: Pauses and warns you.
-        *   **[L] Use Local**: Ignores mismatch, uploads your local file.
-        *   **[G] Use Git**: Extracts the clean file from git commit (memory) and uploads it, **ignoring** your local changes.
+        *   If `Local != Git`: Pauses in **Phase 1** and warns you.
+        *   **[U] Use Local**: Ignores mismatch, uploads your local file.
+        *   **[G] Git Version (Temp)**: **SAFE.** Extracts the clean file from git commit to a **temporary file** and uploads it, **leaving your local disk file unharmed**.
     4.  Compares `Chosen Source` vs `Remote`.
     5.  **Result**: Proceed execution if clean.
 
@@ -129,13 +165,13 @@ Create a JSON file (e.g., `myconfig.json`) with your FTP credentials.
 ## Output
  
  The script outputs a table showing the status of each file:
-*   **MATCH**: Local hash matches remote hash. (Hashes are calculated after stripping `\r` and `\n` to ignore line-ending differences).
-*   **DIFF HASH**: Local content differs from remote content, AND remote content does not match the last-known deployed state.
-*   **MATCH LAST UPDATE**: Remote content differs from Git HEAD/commit version but matches the last version deployed by this script. This means the remote change was authorized/safe and can be overwritten by a newer local version.
+*   **MATCH GOAL**: Remote content exactly matches your intended goal (Local file or chosen Git version).
+*   **MATCH BASELINE**: Remote content matches an earlier baseline (Git commit hash, custom baseline, or the last version deployed by this script). This means the remote is "safe" but outdated.
+*   **DIFF HASH**: Remote content differs from **both** your goal and any baseline. Someone else might have changed the file on the remote server.
 
 ## Conflict Resolution
 
-When using the `--deployOnClean` flag, the script will halt if it encounters a file where the local version differs from the remote version (Status: `DIFF HASH`), and the remote state is unknown (doesn't match HEAD/commit version or last deploy).
+When using the `--deployOnClean` flag, the script will halt if it encounters a file with status **`DIFF HASH`**.
 
 The script will produce a **Conflict Prompt** asking you how to proceed for that specific file:
 
@@ -146,17 +182,24 @@ The script will produce a **Conflict Prompt** asking you how to proceed for that
 
 ### Options:
 
-1.  **replace**:
-    *   **Action**: Overwrites the remote file with your local version.
-    *   **Backup**: The remote file is backed up as part of the standard deployment process (stored in `backups/<project>/<path>/filename.timestamp`).
-    *   **Use when**: You are confident your local version is the intended source of truth and overrides the unknown remote change.
+1.  **[r] replace**:
+    *   **Action**: Overwrites the remote file with your chosen goal version.
+    *   **Use when**: You are confident your local version (or chosen Git version) is the intended source of truth.
 
-2.  **keep**:
+2.  **[ra] replace all**:
+    *   **Action**: Automatically applies `replace` to the current and **all subsequent** remote conflicts in this run. It respects any `keep` decisions made before hitting `ra`.
+    *   **Use when**: You want to overwrite all remaining conflicting files without individual prompts.
+
+3.  **[k] keep**:
     *   **Action**: Skips deployment for this file (keeps the remote version).
     *   **Backup**: The script **immediately downloads** the remote file to `backups/<project>/<path>/filename.timestamp.conflict_bk`.
     *   **Use when**: You want to investigate the remote changes. The immediate backup allows you to manually diff and merge the remote content later without losing it.
 
-3.  **[Enter] / abort**:
+4.  **[l] list**:
+    *   **Action**: Enters **Bulk List Mode**. Skips all remaining deployments for the current run, but automatically downloads every conflicting remote file to a local `.conflict_bk` file.
+    *   **Use when**: You realize there are too many conflicts to resolve manually and you want to stop the deployment while ensuring you have local copies of all remote conflicting files for a later merge.
+
+4.  **[Enter] / abort**:
     *   **Action**: Cancels the entire deployment process immediately.
     *   **Use when**: You are unsure and want to stop everything to check the situation manually.
 

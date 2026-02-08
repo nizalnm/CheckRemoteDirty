@@ -243,16 +243,41 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
         updates_to_save = False
         
         counts = {
-            "MATCH LOCAL": 0,
-            "MATCH GIT": 0,
-            "MATCH LAST UPDATE": 0,
+            "MATCH GOAL": 0,
+            "MATCH BASELINE": 0,
             "DIFF HASH": 0,
             "MISSING": 0,
             "DIFF SIZE": 0,
             "MATCH (Size)": 0,
-            "MISSING/UNK": 0
+            "MISSING/UNK": 0,
+            "LOCAL MISMATCH": 0
         }
+        
+        # Phase 1 Summary
+        total_files = len(file_data_list)
+        decisions = [i.get('local_integrity_decision') for i in file_data_list]
+        mismatched_count = len([i for i in decisions if i is not None])
+        git_count = decisions.count('git_version')
+        local_override_count = decisions.count('use_local')
+        
+        summary_parts = []
+        if git_count > 0 and local_override_count > 0:
+            summary_parts.append(f"using {local_override_count} local, {git_count} git")
+        elif git_count > 0:
+            summary_parts.append("using git")
+        elif local_override_count > 0:
+            summary_parts.append("using local")
+        else:
+            summary_parts.append("all clean")
 
+        summary_str = ", ".join(summary_parts)
+        print(f"\nDeployment Goals: {total_files} files ({mismatched_count} diff local vs git, {summary_str})")
+
+
+
+        conflict_backups = []
+        bulk_list_mode = False
+        bulk_replace_mode = False
 
         for item in file_data_list:
             rel_path = item['path'].replace('\\', '/')
@@ -264,6 +289,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
             git_hash = item.get('git_hash', 'N/A')
             local_ts = item.get('local_ts', item.get('timestamp', 'N/A'))
             local_size = item.get('local_size', item.get('size', None))
+            is_local_git_mismatch = (local_hash != "N/A" and git_hash != "N/A" and local_hash != git_hash)
             
             # Check if file exists remotely and get basic info
             remote_size = None
@@ -324,24 +350,33 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                 status = ""
                 details = ""
                 
-                # Dual Hash Comparison Logic
-                # Check for persistence (Last Deploy)
-                last_deploy_hash = item.get('my_remote', {}).get('hash')
+                # Status Determination Logic
                 
-                if remote_hash == local_hash:
-                    status = "MATCH LOCAL"
-                elif remote_hash == git_hash:
-                    status = "MATCH GIT"
-                elif last_deploy_hash and remote_hash == last_deploy_hash:
-                    status = "MATCH LAST UPDATE"
-                    details += " (Safe to deploy, Remote matches your last deploy)"
+                # 1. Determine "Goal Hash"
+                # If git_version selected, goal is Git. Otherwise goal is Local.
+                if item.get('local_integrity_decision') == 'git_version':
+                    goal_hash = git_hash
                 else:
-                    # Check Baseline if provided
+                    goal_hash = local_hash
+                
+                # 2. MATCH GOAL (matches intended source)
+                if remote_hash == goal_hash:
+                     status = "MATCH GOAL"
+                else:
+                    # 3. MATCH BASELINE (matches any baseline)
+                    last_deploy_hash = item.get('my_remote', {}).get('hash')
                     is_baseline_match = False
-                    if baseline_hash_ref:
+                    
+                    # Check git commit baseline (if not already the goal)
+                    if git_hash != "N/A" and remote_hash == git_hash:
+                        is_baseline_match = True
+                    # Check last deploy baseline
+                    elif last_deploy_hash and remote_hash == last_deploy_hash:
+                        is_baseline_match = True
+                    # Check custom baseline hash ref
+                    elif baseline_hash_ref:
                         baseline_content = get_git_file_content(working_dir, rel_path, baseline_hash_ref)
                         if baseline_content is not None:
-                             # Normalize
                              norm_base = baseline_content.replace(b'\r', b'').replace(b'\n', b'')
                              baseline_md5 = hashlib.md5(norm_base).hexdigest()
                              if remote_hash == baseline_md5:
@@ -349,16 +384,16 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                     
                     if is_baseline_match:
                         status = "MATCH BASELINE"
-                        details += " (Safe, matches baseline commit)"
+                        details += " (Safe, matches baseline/commit/last-deploy)"
                     else:
                         status = "DIFF HASH"
-                    if local_size != remote_size:
-                         # Likely Line Endings if strictly hashing but size diff, 
-                         # but here we normalized, so it's a genuine content match/diff.
-                         pass
-                
+
                 # Add Timestamps to Details
                 details += f"[L: {local_ts_display} {ts_op} R: {remote_mtime or 'N/A'}]"
+                
+                if is_local_git_mismatch and not item.get('local_integrity_decision'):
+                     details += f" {Colors.FAIL}[LOCAL MISMATCH]{Colors.ENDC}"
+                     counts["LOCAL MISMATCH"] += 1
                 
             except ftplib.error_perm as e:
                 status = "MISSING"
@@ -381,26 +416,38 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
             # Collect candidates for deployment
             if deploy_on_clean:
                 # Safe conditions:
-                # 1. MATCH GIT: Remote equals Git HEAD (Clean, not yet deployed) -> DEPLOY
-                # 2. MATCH LOCAL: Remote equals Local (Already deployed) -> SKIP
+                # 1. MATCH GOAL: Remote already matches what we want to deploy -> SKIP
+                # 2. MATCH BASELINE: Remote is safe to overwrite -> DEPLOY
                 # 3. MISSING: Remote file doesn't exist -> DEPLOY
                 #
                 # Unsafe Condition:
                 # DIFF HASH: Remote matches neither (Potential unknown change) -> UNSAFE
                 
-                if status == "MATCH LOCAL":
-                    print(f"Skipping {rel_path} (Already matches local)")
+                if status == "MATCH GOAL":
+                    print(f"Skipping {rel_path} (Already matches goal)")
                     # Auto-seed persistence if needed
                     item['my_remote'] = {
-                        "hash": local_hash, 
+                        "hash": goal_hash, 
                         "timestamp": datetime.datetime.now().isoformat()
                     }
                     updates_to_save = True
                     continue
                 
                 if status == "DIFF HASH":
-                    print(f"!! CONFLICT: {rel_path} differs from remote (DIFF HASH).")
-                    user_input = input(f"   Type 'replace' to overwrite remote, 'keep' to skip (backup remote), or Enter to abort: ").strip().lower()
+                    if bulk_list_mode:
+                        user_input = 'list' # Auto-select list behavior
+                    elif bulk_replace_mode:
+                        user_input = 'replace'
+                    else:
+                        print(f"!! CONFLICT: {rel_path} differs from remote (DIFF HASH).")
+                        user_input = input(f"   Type '[r]' replace, '[ra]' replace all, '[k]' keep, '[l]' list, or Enter to abort: ").strip().lower()
+
+                    if user_input in ['ra', 'replace all']:
+                        bulk_replace_mode = True
+                        user_input = 'replace'
+                    
+                    if user_input in ['r', 'replace']:
+                        user_input = 'replace'
 
                     if user_input == 'replace':
                         deployable_candidates.append({
@@ -414,8 +461,12 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                         })
                         print(f"   >> Marked for REPLACEMENT (Remote will be backed up during deployment).")
 
-                    elif user_input == 'keep':
-                        # Backup remote file for manual merging / safety since we're not deploying over it
+                    elif user_input in ['keep', 'list', 'l']:
+                        if user_input in ['list', 'l']:
+                            bulk_list_mode = True
+                            deployable_candidates = None # Abort deployment
+                        
+                        # Backup remote file logic
                         try:
                             script_dir = os.path.dirname(os.path.abspath(__file__))
                             project_name = os.path.basename(working_dir)
@@ -427,48 +478,60 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                             backup_filename = f"{os.path.basename(rel_path)}.{ts_suffix}.conflict_bk"
                             backup_full_path = os.path.join(backup_file_dir, backup_filename)
                             
-                            print(f"   >> Downloading backup to {backup_full_path} ...", end=" ")
-                            with open(backup_full_path, 'wb') as f_bk:
-                                ftp.retrbinary(f"RETR {remote_path}", f_bk.write)
-                            print("Done.")
+                            if not os.path.exists(backup_full_path): # Avoid re-downloading if we loop
+                                print(f"   >> Downloading conflict backup to {backup_full_path} ...", end=" ")
+                                with open(backup_full_path, 'wb') as f_bk:
+                                    ftp.retrbinary(f"RETR {remote_path}", f_bk.write)
+                                print("Done.")
+                            else:
+                                print(f"   >> Backup already exists at {backup_full_path}")
+                                
+                            if user_input in ['list', 'l'] or bulk_list_mode:
+                                conflict_backups.append(backup_full_path)
+
                         except Exception as e:
                             print(f"\n   >> Backup failed: {e}")
-                            print("   >> Warning: proceeded with 'keep' but failed to download backup.")
-
-                        print(f"   >> Skipped (Remote kept unchanged).")
+                        
+                        if bulk_list_mode:
+                            print(f"   >> Listed (Skipping deployment).")
+                        else:
+                            print(f"   >> Skipped (Remote kept unchanged).")
 
                     else:
                         print("   >> Aborting deployment.")
-                        deployable_candidates = None # Invalidate deployment
+                        deployable_candidates = None 
                         break 
 
                 if status in ["MATCH GIT", "MATCH LAST UPDATE", "MATCH BASELINE", "MISSING"]:
-                    # Check for LOCAL <> GIT mismatches (Safety Check)
-                    is_local_git_mismatch = False
-                    git_hash = item.get('git_hash')
-                    local_hash = item.get('local_hash')
+                    # Check for LOCAL <> GIT mismatches (Safety Check) using pre-calculated flag
                     commit_ref = item.get('commit_ref', "HEAD") # Default if missing
                     
-                    # Only flag mismatch if git_hash is valid (not N/A) and differs from local
-                    if git_hash and git_hash != "N/A" and local_hash and local_hash != git_hash:
-                         is_local_git_mismatch = True
-
-                    deployable_candidates.append({
-                        "item_ref": item, # Reference to mutable item dict for updating my_remote
-                        "rel_path": rel_path,
-                        "remote_path": remote_path,
-                        "status": status,
-                        "local_path": os.path.join(working_dir, rel_path),
-                        "remote_mtime": remote_mtime, # for backup suffix
-                        "remote_size": remote_size,
-                        "local_git_mismatch": is_local_git_mismatch,
-                        "git_hash": git_hash,
-                        "local_hash": local_hash,
-                        "commit_ref": commit_ref 
-                    })
+                    if deployable_candidates is not None:
+                        deployable_candidates.append({
+                            "item_ref": item, # Reference to mutable item dict for updating my_remote
+                            "rel_path": rel_path,
+                            "remote_path": remote_path,
+                            "status": status,
+                            "local_path": os.path.join(working_dir, rel_path),
+                            "remote_mtime": remote_mtime, # for backup suffix
+                            "remote_size": remote_size,
+                            "local_git_mismatch": is_local_git_mismatch,
+                            "git_hash": git_hash,
+                            "local_hash": local_hash,
+                            "commit_ref": commit_ref,
+                            "use_git_content": (item.get('local_integrity_decision') == 'git_version'),
+                            "temp_git_path": item.get('temp_git_path')
+                        })
         
         # End of comparison loop
         
+        if conflict_backups:
+            print(f"\n{Colors.WARNING}--- Backup Manifest (Conflicted Files) ---{Colors.ENDC}")
+            print(f"The following remote files were backed up for manual merging:")
+            for bk_path in conflict_backups:
+                print(f"- {bk_path}")
+            print("-" * 60)
+
         print("-" * (col_width + 15 + 30 + 6))
         print("Summary:")
         total_files = len(file_data_list)
@@ -485,6 +548,21 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                  return
 
             print(f"\nAll {len(deployable_candidates)} remote files are clean (match HEAD or missing).")
+            
+            # Sub-Phase: Local Mismatch Safety Warning
+            mismatched_candidates = [c for c in deployable_candidates if c.get('local_git_mismatch') and not c['item_ref'].get('local_integrity_decision')]
+            if mismatched_candidates:
+                print(f"\n{Colors.WARNING}--- WARNING: Deploying files with Uncommitted Local Changes ---{Colors.ENDC}")
+                print(f"The following files differ from Git {args.gitCommitHash or 'HEAD'}:")
+                for c in mismatched_candidates:
+                    print(f" - {c['rel_path']} (Git: {c['git_hash'][:8]} vs Local: {c['local_hash'][:8]})")
+                
+                confirm = input("\nProceed anyway? (y/N): ").strip().lower()
+                if confirm != 'y':
+                    print("Aborting deployment.")
+                    ftp.quit()
+                    return
+
             response = input("Proceed with deployment? (Y/n): ").strip()
             if response in ['Y', 'y', '']:
                 print("\nStarting deployment...")
@@ -531,19 +609,14 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                         ensure_remote_dirs(ftp, remote_path)
                         
                         if item.get('use_git_content'):
-                             # Use Git Content (In-Memory)
-                             commit_ref = item.get('commit_ref', 'HEAD')
-                             try:
-                                 git_content = get_git_file_content(working_dir, rel_path, commit_ref)
-                                 if git_content is None:
-                                     raise Exception(f"Content retrieval returned None for {rel_path}@{commit_ref}")
-                                 
-                                 f_up = io.BytesIO(git_content)
+                             # Use Git Content from Temp Path (Safe/Immutable)
+                             git_temp_path = item.get('temp_git_path')
+                             if not git_temp_path or not os.path.exists(git_temp_path):
+                                  raise Exception(f"Git temporary content missing for {rel_path}. Please re-run check.")
+                             
+                             with open(git_temp_path, 'rb') as f_up:
                                  ftp.storbinary(f"STOR {remote_path}", f_up)
-                                 print(f"Done (from {commit_ref}).")
-                             except Exception as e:
-                                 print(f"Error retrieving/uploading git content: {e}")
-                                 raise e
+                             print(f"Done (from {item.get('commit_ref', 'Git Commit')}).")
                         else:
                              with open(local_path, 'rb') as f_up:
                                  ftp.storbinary(f"STOR {remote_path}", f_up)
@@ -798,6 +871,89 @@ def main():
     # FTP Comparison Step
     if args.ftpConfig: 
         if affected_files_data:
+            # Phase 1: Local Integrity Check (Local vs Git)
+            mismatched_files = [item for item in affected_files_data if item.get('local_hash') != "N/A" and item.get('git_hash') != "N/A" and item.get('local_hash') != item.get('git_hash')]
+            
+            if mismatched_files:
+                print(f"\n{Colors.WARNING}--- Phase 1: Local Integrity Check (Mismatched Local vs Git) ---{Colors.ENDC}")
+                col_w = max(40, max([len(i['path']) for i in mismatched_files]) + 2)
+                print(f"{'File':<{col_w}} | {'Status'}")
+                print("-" * (col_w + 15))
+                for item in mismatched_files:
+                    # Color the status red
+                    print(f"{item['path']:<{col_w}} | {Colors.FAIL}LOCAL MISMATCH{Colors.ENDC}")
+                
+                print(f"\n{Colors.WARNING}Uncommitted local changes or merge patches detected.{Colors.ENDC}")
+                
+                bulk_choice = None
+                if len(mismatched_files) > 1:
+                    while True:
+                        print(f"\n{Colors.BOLD}Bulk Decision for {len(mismatched_files)} mismatches:{Colors.ENDC}")
+                        print(f"  [U]se Local for ALL")
+                        print(f"  [G]it Version (Temp) for ALL")
+                        print(f"  [I]ndividual decisions")
+                        print(f"  [A]bort")
+                        resp = input("   Choice: ").strip().lower()
+                        if resp in ['u', 'local', 'g', 'git', 'i', 'individual', 'a', 'abort']:
+                            bulk_choice = resp
+                            break
+                        print(f"{Colors.FAIL}Invalid choice.{Colors.ENDC}")
+
+                if bulk_choice == 'a' or bulk_choice == 'abort':
+                    print("   >> Aborting.")
+                    sys.exit(0)
+
+                for item in mismatched_files:
+                    while True:
+                        if bulk_choice in ['u', 'local']:
+                            choice = 'u'
+                        elif bulk_choice in ['g', 'git']:
+                            choice = 'g'
+                        else:
+                            print(f"\nProcessing: {Colors.BOLD}{item['path']}{Colors.ENDC}")
+                            print(f"  Git:   {item['git_hash']} ({item['git_ts']})")
+                            print(f"  Local: {item['local_hash']} ({item['local_ts']})")
+                            choice = input("   Decision: [U]se Local, [G]it Version (Temp), or [A]bort: ").strip().lower()
+                        
+                        if choice in ['u', 'local']:
+                            item['local_integrity_decision'] = 'use_local'
+                            if not bulk_choice: print("   >> Decision: Using LOCAL version as baseline.")
+                            break
+                        elif choice in ['g', 'git']:
+                            item['local_integrity_decision'] = 'git_version'
+                            
+                            # Fetch Git Version to Temp Path for safety (Local copy untouched)
+                            script_dir = os.path.dirname(os.path.abspath(__file__))
+                            project_name = os.path.basename(working_dir)
+                            temp_dir = os.path.join(script_dir, "backups", project_name, "temp_git_blobs")
+                            os.makedirs(temp_dir, exist_ok=True)
+                            
+                            rel_path = item['path']
+                            temp_path = os.path.join(temp_dir, rel_path)
+                            os.makedirs(os.path.dirname(temp_path), exist_ok=True)
+                            
+                            if not bulk_choice: print(f"   >> Fetching Git content to temp path for deployment...", end=" ")
+                            git_bytes = get_git_file_content(working_dir, rel_path, args.gitCommitHash or 'HEAD')
+                            if git_bytes is None:
+                                print(f"{Colors.FAIL}FAILED to fetch git content for {rel_path}.{Colors.ENDC}")
+                                sys.exit(1)
+                                
+                            with open(temp_path, 'wb') as f_temp:
+                                f_temp.write(git_bytes)
+                            
+                            item['temp_git_path'] = temp_path
+                            if not bulk_choice: print("Done.")
+                            break
+                        elif choice in ['a', 'abort']:
+                            print("   >> Aborting.")
+                            sys.exit(0)
+                        else:
+                            print(f"{Colors.FAIL}Invalid choice.{Colors.ENDC}")
+                
+                if bulk_choice in ['u', 'local', 'g', 'git']:
+                     target_name = "LOCAL" if bulk_choice in ['u', 'local'] else "GIT"
+                     print(f"\n   >> Bulk Decision Applied: Using {target_name} version for all {len(mismatched_files)} files.")
+
             # Determine which file to save updates to (vsGit or vsHashFile or updateHashFile)
             hash_file_path = args.vsGit or args.vsHashFile or args.updateHashFile
             compare_with_ftp(args.ftpConfig, affected_files_data, check_size_only=args.checkSizeOnly, deploy_on_clean=args.deployOnClean, working_dir=working_dir, hash_file_path=hash_file_path, baseline_hash_ref=args.gitBaselineHash)
