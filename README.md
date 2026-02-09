@@ -1,6 +1,8 @@
 # CheckRemoteDirty
 
-A Python utility to verify if locally modified files in a Git repository differ from those deployed on a remote FTP server. By comparing your own local hash snapshots with the remote server before deployment, you can avoid accidentally wiping out someone else's uncommitted work.
+A Python utility to verify if locally modified files in a Git repository differ from those deployed on a remote FTP server. This is especially useful when your project doesn't have proper CI/CD set up and your teammates have the all-too-common  habit of not committing their changes before deploying to the remote server. 
+
+By comparing your local hash snapshots with the remote server before deployment, you can avoid accidentally wiping out someone else's hard work — their grave sin of git-slacking notwithstanding.
 
 ## Quick Start (30-Second Setup)
 
@@ -27,6 +29,17 @@ Sample scripts are provided in the repo to save you from typing long commands:
 *   `postdeploy`: Verified local disk matching remote.
 
 ---
+
+## Why This Tool Exists (The Real-World Problem)
+
+You know the scenario: It's 4:45 PM on Friday. You've got a quick CSS fix to push live. But wait, did Sarah deploy her PHP changes this morning without committing? 
+If you FTP your local files, will you overwrite her work?
+
+**Without this tool**: You either (a) blindly deploy and hope, (b) spend 20 minutes manually diffing files, or (c) give up and leave it for Monday.
+
+**With this tool**: Run one command, get a clear "SAFE" or "CONFLICT" status in seconds.
+
+*Hold the pitchforks, o CI/CD crusaders! I know proper deployment pipelines solve this. But alas, not every project gets the red-carpet DevOps treatment.*
 
 ## Technical Overview: The Two-Phase Safety Check
 
