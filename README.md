@@ -55,7 +55,7 @@ Before connecting to the server, the script compares your **Local Disk Files** a
 | **Match** | `Clean` | Proceed automatically. |
 | **Mismatch** | `LOCAL MISMATCH` | **Decision required**: Use Local, Use Git (Temp), or Abort. |
 
-> **Note on [G]it Version (Temp)**: This is the safest option. The script fetches the "clean" file from Git into a temporary folder for deployment. Your local disk file remains completely untouched.
+> **Note on [G]it Version (Temp)**: The script fetches the "clean" file from Git into a temporary folder for deployment. No dirty local working directory files were harmed in this process.
 
 ### Phase 2: Remote Comparison (Local/Git vs Remote)
 Once the local goal is set, the script connects to FTP and compares your **Goal** against the **Remote File**.
@@ -161,7 +161,7 @@ A: Likely a line-ending mismatch (Windows CRLF vs Linux LF). Use the included `d
 ### Advanced Options
 *   `--ftpConfig <file>`: Path to your FTP JSON config.
 *   `--gitCommitHash <hash>`: Use a specific commit version instead of `HEAD`.
-*   `--gitBaselineHash <hash>`: Define a specific "expected" remote state.
+*   `--gitBaselineHash <hash>`: Define a specific "expected" (i.e. safe to be overwritten) remote state.
 *   `--deployOnClean`: Prompts to upload local changes if the remote is "safe."
 *   **`--checkSizeOnly`**: Faster, size-only comparison (warning: inaccurate across platforms).
 
@@ -173,7 +173,7 @@ A standalone utility included in this repo to compare two files (or a file vs gi
 
 **Usage**:
 ```bash
-python diff_normalized.py file1.php file2.php
+python diff_normalized.py file_a.php::file_a_v2.php [file_b.php::file_b_v2.php | ...]
 python diff_normalized.py file.php --vsGit HEAD
 ```
 
