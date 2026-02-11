@@ -886,7 +886,13 @@ def main():
                 print(f"\n{Colors.WARNING}Uncommitted local changes or merge patches detected.{Colors.ENDC}")
                 
                 bulk_choice = None
-                if len(mismatched_files) > 1:
+
+                # Auto-default to 'Use Local' if no git commit hash provided
+                if not args.gitCommitHash:
+                    print(f"\nNo --gitCommitHash provided. Defaulting to [U]se Local for all {len(mismatched_files)} mismatches.")
+                    bulk_choice = 'u'
+
+                if not bulk_choice and len(mismatched_files) > 1:
                     while True:
                         print(f"\n{Colors.BOLD}Bulk Decision for {len(mismatched_files)} mismatches:{Colors.ENDC}")
                         print(f"  [U]se Local for ALL")
