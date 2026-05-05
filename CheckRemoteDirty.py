@@ -27,8 +27,8 @@ def calculate_file_hash_and_size(filepath):
     try:
         with open(filepath, "rb") as f:
             for chunk in iter(lambda: f.read(4096), b""):
-                # Normalize: Strip CR and LF to be cross-platform safe
-                chunk_norm = chunk.replace(b'\r', b'').replace(b'\n', b'')
+                # Normalize: Strip CR, LF, Space, and Tab to be whitespace-agnostic
+                chunk_norm = chunk.replace(b'\r', b'').replace(b'\n', b'').replace(b' ', b'').replace(b'\t', b'')
                 hash_md5.update(chunk_norm)
                 size += len(chunk)
         return hash_md5.hexdigest(), size
@@ -340,8 +340,8 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                 # Check hash (Standard mode) with Normalization
                 h_md5 = hashlib.md5()
                 def handle_binary(more_data):
-                    # Normalize: Strip CR and LF
-                    chunk_norm = more_data.replace(b'\r', b'').replace(b'\n', b'')
+                    # Normalize: Strip CR, LF, Space, and Tab
+                    chunk_norm = more_data.replace(b'\r', b'').replace(b'\n', b'').replace(b' ', b'').replace(b'\t', b'')
                     h_md5.update(chunk_norm)
 
                 ftp.retrbinary(f"RETR {remote_path}", handle_binary)
@@ -377,7 +377,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                     elif baseline_hash_ref:
                         baseline_content = get_git_file_content(working_dir, rel_path, baseline_hash_ref)
                         if baseline_content is not None:
-                             norm_base = baseline_content.replace(b'\r', b'').replace(b'\n', b'')
+                             norm_base = baseline_content.replace(b'\r', b'').replace(b'\n', b'').replace(b' ', b'').replace(b'\t', b'')
                              baseline_md5 = hashlib.md5(norm_base).hexdigest()
                              if remote_hash == baseline_md5:
                                  is_baseline_match = True
@@ -629,7 +629,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                              # Calculate remote hash again
                              h_check = hashlib.md5()
                              def handle_check(data):
-                                 chunk_norm = data.replace(b'\r', b'').replace(b'\n', b'')
+                                 chunk_norm = data.replace(b'\r', b'').replace(b'\n', b'').replace(b' ', b'').replace(b'\t', b'')
                                  h_check.update(chunk_norm)
                              
                              ftp.retrbinary(f"RETR {remote_path}", handle_check)
@@ -644,7 +644,7 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                              h_local_check = hashlib.md5()
                              with open(local_path, "rb") as f_re:
                                  for chunk in iter(lambda: f_re.read(4096), b""):
-                                     chunk_norm = chunk.replace(b'\r', b'').replace(b'\n', b'')
+                                     chunk_norm = chunk.replace(b'\r', b'').replace(b'\n', b'').replace(b' ', b'').replace(b'\t', b'')
                                      h_local_check.update(chunk_norm)
                              local_check_hash = h_local_check.hexdigest()
 
@@ -780,7 +780,7 @@ def main():
             git_ts = "N/A"
             
             if git_content is not None:
-                norm_git_content = git_content.replace(b'\r', b'').replace(b'\n', b'')
+                norm_git_content = git_content.replace(b'\r', b'').replace(b'\n', b'').replace(b' ', b'').replace(b'\t', b'')
                 git_hash = hashlib.md5(norm_git_content).hexdigest()
                 git_ts = get_git_file_timestamp(working_dir, rel_path, commit_ref)
             
