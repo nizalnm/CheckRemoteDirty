@@ -16,6 +16,8 @@ class Colors:
     OKGREEN = '\033[92m'
     WARNING = '\033[93m'
     FAIL = '\033[91m'
+    BG_FAIL = '\033[41m'
+    WHITE = '\033[97m'
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
@@ -126,20 +128,34 @@ def get_files_changed_in_commit(repo_path, commit_hash):
         # -r: recurse into subtrees
         # --no-commit-id: suppress commit ID output
         # --name-only: show only names of changed files
-        result = subprocess.run(
-            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", commit_hash],
-            cwd=repo_path,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True
-        )
+        if ".." in commit_hash:
+            # Handle ranges (e.g., A..B) nicely to just get the net diff
+            result = subprocess.run(
+                ["git", "diff", "--name-only", commit_hash],
+                cwd=repo_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True
+            )
+        else:
+            result = subprocess.run(
+                ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", commit_hash],
+                cwd=repo_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True
+            )
         
         files = []
+        ignore_prefixes = ('.agent/', '.agents/', '.beads/', '.ralph-tui/', 'tasks/')
         for line in result.stdout.splitlines():
             if line.strip():
                 # Handle quoting if present
-                files.append(line.strip().strip('"'))
+                clean_path = line.strip().strip('"')
+                if not clean_path.startswith(ignore_prefixes):
+                    files.append(clean_path)
         return files
     except subprocess.CalledProcessError as e:
         print(f"Error getting files from commit {commit_hash}: {e.stderr}")
@@ -230,6 +246,10 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
     try:
         ftp = connect_ftp(config)
         remote_root = config.get('remote_root', '/')
+        
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        project_name = os.path.basename(working_dir)
+        backup_dir = os.path.join(script_dir, "backups", project_name)
         
         # Calculate dynamic column width
         max_path_len = max([len(item['path']) for item in file_data_list]) if file_data_list else 40
@@ -439,7 +459,27 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                     elif bulk_replace_mode:
                         user_input = 'replace'
                     else:
-                        print(f"!! CONFLICT: {rel_path} differs from remote (DIFF HASH).")
+                        # Check for existing backup
+                        backup_exists = False
+                        ts_suffix = remote_mtime.replace(':', '').replace(' ', '_').replace('-', '') if remote_mtime else None
+                        if ts_suffix:
+                            backup_file_dir = os.path.join(backup_dir, os.path.dirname(rel_path))
+                            backup_filename_std = f"{os.path.basename(rel_path)}.{ts_suffix}"
+                            backup_filename_conflict = f"{os.path.basename(rel_path)}.{ts_suffix}.conflict_bk"
+                            
+                            path_std = os.path.join(backup_file_dir, backup_filename_std)
+                            path_conflict = os.path.join(backup_file_dir, backup_filename_conflict)
+                            
+                            if os.path.exists(path_std) or os.path.exists(path_conflict):
+                                backup_exists = True
+                        
+                        conflict_msg = f"!! CONFLICT: {rel_path} differs from remote (DIFF HASH)."
+                        if backup_exists:
+                            print(f"{conflict_msg} Backup already exists for this modified timestamp.")
+                        else:
+                            print(conflict_msg)
+                            print(f"{Colors.BG_FAIL}{Colors.WHITE} No local backup file exists for the modified timestamp. If you have backed up recently, this might mean the remote file has been modified by someone else. Replacing the remote file might cause irrecoverable loss of their edit. Advisable to keep remote file first for careful backup and merging {Colors.ENDC}")
+                        
                         user_input = input(f"   Type '[r]' replace, '[ra]' replace all, '[k]' keep, '[l]' list, or Enter to abort: ").strip().lower()
 
                     if user_input in ['ra', 'replace all']:
@@ -468,9 +508,6 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                         
                         # Backup remote file logic
                         try:
-                            script_dir = os.path.dirname(os.path.abspath(__file__))
-                            project_name = os.path.basename(working_dir)
-                            backup_dir = os.path.join(script_dir, "backups", project_name)
                             backup_file_dir = os.path.join(backup_dir, os.path.dirname(rel_path))
                             os.makedirs(backup_file_dir, exist_ok=True)
                             
@@ -566,9 +603,6 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
             response = input("Proceed with deployment? (Y/n): ").strip()
             if response in ['Y', 'y', '']:
                 print("\nStarting deployment...")
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                project_name = os.path.basename(working_dir)
-                backup_dir = os.path.join(script_dir, "backups", project_name)
                 print(f"Backups will be stored in: {backup_dir}")
                 
                 failed_deploys = []
