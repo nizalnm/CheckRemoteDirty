@@ -79,9 +79,42 @@ pemohon/ajax_search.php                  | DIFF HASH       | !! CONFLICT: Unknow
 When a **`DIFF HASH`** is encountered during deployment, you can choose:
 1.  **`[r]` replace**: Overwrites the remote file with your chosen version.
 2.  **`[ra]` replace all**: Automatically applies "replace" to all remaining conflicts.
-3.  **`[k]` keep**: Skips deployment for this file and **immediately downloads a backup** of the remote version to the `backups/` folder.
-4.  **`[l]` list**: Skips all deployments but downloads backups for **all** remaining conflicting files.
+3.  **`[k]` keep**: Skips deployment for this file and **immediately downloads a backup** of the remote version to the `backups/` folder (plus a `.meta.json` sidecar — see below).
+4.  **`[l]` list**: Skips all deployments but downloads backups (and sidecars) for **all** remaining conflicting files.
 5.  **`[Enter]` / abort**: Cancels the entire process immediately.
+
+#### Conflict Handoff: the `.meta.json` Sidecar
+
+Downloading the remote backup tells you *that* a file diverged, but not *how* to reconcile it. So alongside every `<file>.<timestamp>.conflict_bk`, `CheckRemoteDirty` writes a `<file>.<timestamp>.conflict_bk.meta.json` — an accountable record of the conflict, so resolving it later doesn't mean re-deriving the history by hand:
+
+```json
+{
+  "schema": "crd-conflict-meta/1",
+  "rel_path": "config/db.php",
+  "conflict_backup": "db.php.20260210_030405.conflict_bk",
+  "detected_at": "2026-02-10T03:04:05",
+  "remote_mtime": "2026-02-09 22:10:00",
+  "hashes": { "local": "…", "git": "…", "remote": "…", "goal": "…" },
+  "baseline": {
+    "merge_base_ref": "<commit to use as the 3-way merge base, if known>",
+    "git_baseline_ref": "<--gitBaselineHash, if passed>",
+    "last_deploy_commit": "<commit recorded at this file's previous deploy>",
+    "last_deploy_hash": "…"
+  },
+  "merge_hint": "3-way: git show <ref>:<path> > base; git merge-file <local> base <conflict_bk>."
+}
+```
+
+**Why the base matters.** A two-way diff (local vs the remote backup) can't tell whether a line is a *local addition* or a *remote deletion* — you have to reconstruct that from history. If `merge_base_ref` is known you have the common ancestor, and a real **3-way merge** resolves every one-sided change automatically, leaving only the lines *both* sides changed for a human:
+
+```bash
+git show <merge_base_ref>:<rel_path> > base
+git merge-file <local_working_file> base <the .conflict_bk>   # clean, or <<<<<<< markers where both changed
+```
+
+**Where the base comes from** (priority order): `--gitBaselineHash` if you pass it, else `deployed_commit` — which `CheckRemoteDirty` now records in the hash manifest's `my_remote` on every successful deploy, so each file remembers the commit it was last deployed from. If neither is available, `merge_base_ref` is `null` and you fall back to a two-way reconciliation.
+
+> The sidecar is **additive and best-effort**: it never blocks a deploy, and its `.meta.json` name can't be mistaken for a `.conflict_bk`. Tooling that only reads `.conflict_bk` files is unaffected, and older hash manifests (without `deployed_commit`) still load — the new fields simply read as `null`.
 
 ---
 

@@ -119,6 +119,26 @@ def get_git_file_timestamp(repo_path, rel_path, commit_ref="HEAD"):
     except subprocess.CalledProcessError:
         return None
 
+def resolve_git_commit(repo_path, commit_ref="HEAD"):
+    """
+    Resolve a ref (branch/tag/HEAD/short-sha) to its full 40-char commit SHA.
+    Recorded at deploy time so a later conflict has an exact, retrievable base
+    for a 3-way merge (git merge-file base local remote). Returns None on error.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", commit_ref],
+            cwd=repo_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+        sha = result.stdout.strip()
+        return sha or None
+    except subprocess.CalledProcessError:
+        return None
+
 def get_files_changed_in_commit(repo_path, commit_hash):
     """
     Returns a list of files that were changed (added/modified) in the specified commit_hash.
@@ -522,7 +542,44 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                                 print("Done.")
                             else:
                                 print(f"   >> Backup already exists at {backup_full_path}")
-                                
+
+                            # Accountable handoff: write a sidecar recording exactly what
+                            # diverged and, when known, the git commit to use as the 3-way
+                            # merge base. Additive + best-effort: never blocks the deploy,
+                            # and the .meta.json name can't be mistaken for a .conflict_bk.
+                            try:
+                                last_deploy = item.get('my_remote', {}) or {}
+                                base_ref = baseline_hash_ref or last_deploy.get('deployed_commit')
+                                meta = {
+                                    "schema": "crd-conflict-meta/1",
+                                    "rel_path": rel_path.replace('\\', '/'),
+                                    "conflict_backup": os.path.basename(backup_full_path),
+                                    "detected_at": datetime.datetime.now().isoformat(),
+                                    "remote_mtime": remote_mtime,
+                                    "hashes": {
+                                        "local": local_hash,
+                                        "git": git_hash,
+                                        "remote": remote_hash,
+                                        "goal": goal_hash,
+                                    },
+                                    "baseline": {
+                                        # exact commit to pull the 3-way base from, if known
+                                        "merge_base_ref": base_ref,
+                                        "git_baseline_ref": baseline_hash_ref,
+                                        "last_deploy_commit": last_deploy.get('deployed_commit'),
+                                        "last_deploy_hash": last_deploy.get('hash'),
+                                    },
+                                    "merge_hint": (
+                                        "3-way: git show {ref}:{path} > base; "
+                                        "git merge-file <local> base <conflict_bk>. "
+                                        "Falls back to 2-way if merge_base_ref is null."
+                                    ).format(ref=base_ref or "<baseline>", path=rel_path.replace('\\', '/')),
+                                }
+                                with open(backup_full_path + ".meta.json", 'w', encoding='utf-8') as f_meta:
+                                    json.dump(meta, f_meta, indent=2)
+                            except Exception as meta_err:
+                                print(f"   >> (note: could not write conflict sidecar: {meta_err})")
+
                             if user_input in ['list', 'l'] or bulk_list_mode:
                                 conflict_backups.append(backup_full_path)
 
@@ -699,10 +756,19 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                         if not verified:
                            failed_deploys.append(rel_path)
                         else:
-                            # Update persistence data on success
+                            # Update persistence data on success. Record the commit
+                            # this deploy corresponds to (deployed_commit) so a future
+                            # conflict on this file has an exact 3-way merge base even
+                            # when no --gitBaselineHash is passed. deployed_from notes
+                            # whether the bytes came from the commit or an uncommitted
+                            # local edit (in which case the commit is an approximate base).
+                            deployed_from = 'git' if item.get('use_git_content') else 'local'
+                            deployed_commit = resolve_git_commit(working_dir, item.get('commit_ref', 'HEAD'))
                             item['item_ref']['my_remote'] = {
-                                "hash": local_check_hash, 
-                                "timestamp": datetime.datetime.now().isoformat()
+                                "hash": local_check_hash,
+                                "timestamp": datetime.datetime.now().isoformat(),
+                                "deployed_commit": deployed_commit,
+                                "deployed_from": deployed_from,
                             }
                             updates_to_save = True
 
