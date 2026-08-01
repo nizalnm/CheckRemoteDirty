@@ -1,10 +1,18 @@
 # Proposal: safe, rollbackable deletion support for CRD
 
+> **Status: implemented (2026-08-02), sections 3.1–3.8 all built as designed.**
+> See the README's "Deletion Support" section for user-facing usage; this doc
+> stays as the design record and reasoning. Live-tested against widgetco's
+> real remote (see below) — Phase 1 detection and Phase 2's candidate-check
+> both confirmed working against the actual stale file that motivated this;
+> the confirmation step was deliberately aborted during testing rather than
+> executed, pending the user's own separate go-ahead to actually quarantine
+> that one file for real.
+
 Written after a real incident (2026-08-02, widgetco): `resources/forms/legacy_signup_form.pdf.b64`
 was deliberately deleted in git (superseded by a new form generator) but CRD had
 no way to remove it from the live server — it's currently either an unresolvable
-`DIFF HASH` needing a manual keep/skip, or silently left stale. Nothing implemented
-yet; this is a design for discussion before any code changes.
+`DIFF HASH` needing a manual keep/skip, or silently left stale.
 
 ## 1. Why this is a distinct, harder problem than upload/overwrite
 

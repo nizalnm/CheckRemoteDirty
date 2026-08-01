@@ -194,9 +194,64 @@ A: Likely a line-ending mismatch (Windows CRLF vs Linux LF). Use the included `d
 ### Advanced Options
 *   `--ftpConfig <file>`: Path to your FTP JSON config.
 *   `--gitCommitHash <hash>`: Use a specific commit version instead of `HEAD`.
+*   `--vsGitListHash <A..B>`: Derive the file list from a git range instead of the current dirty/`HEAD` state - the only mode that also detects deletions (see below).
 *   `--gitBaselineHash <hash>`: Define a specific "expected" (i.e. safe to be overwritten) remote state.
 *   `--deployOnClean`: Prompts to upload local changes if the remote is "safe."
+*   `--exclude <glob>` (repeatable): Drop matching paths from the file list entirely before any FTP check/deploy/prune. On top of a fixed, non-configurable exclusion for `.agent/`, `.agents/`, `.beads/`, `.ralph-tui/`, `tasks/`.
 *   **`--checkSizeOnly`**: Faster, size-only comparison (warning: inaccurate across platforms).
+
+---
+
+## Deletion Support: quarantine, restore, purge
+
+CRD used to have no concept of deletions at all - a file removed from git just
+silently stayed live on the server forever, or showed up as a confusing,
+unresolvable conflict. That's fixed, deliberately conservatively: **nothing
+is ever deleted outright.** See `docs/deletion-support-proposal.md` for the
+full design reasoning; the short version:
+
+1. **Detection is always on, action is always opt-in.** When you run with
+   `--vsGitListHash <A..B>` (or `--gitCommitHash`), any path git shows as
+   removed between those two points is reported - printed plainly, every
+   time, with no flag needed. Nothing happens to it on the remote unless you
+   also pass `--pruneDeleted`.
+2. **`--pruneDeleted` soft-deletes, never hard-deletes.** Confirmed
+   candidates (paths git says are gone *and* still present on the remote)
+   are listed, and you have to type back the exact count to proceed - a
+   stricter confirmation than the ordinary upload prompt, on purpose. What
+   actually happens is an **atomic FTP rename** into
+   `<remote_root>/.crd-trash/<timestamp>/<original/path>` - the file never
+   stops existing on the server, it just moves. Deny-list a small set of
+   paths this will never touch regardless of what git says (`.htaccess`,
+   `web.config`, `.env`, anything already under `.crd-trash/`, any path that
+   normalizes outside the project root).
+3. **`--restoreFromTrash <pattern>` undoes it.** Matches quarantined entries
+   by their original path (glob or plain substring), newest batch first,
+   and moves the chosen one back via the same atomic rename.
+4. **`--purgeTrash --olderThanDays N [--yes]` is the only genuinely
+   permanent step**, and it's a separate command on its own retention
+   window. Without `--yes` it's a dry-run listing of what *would* be
+   purged - nothing is ever removed by accident on this path.
+
+Every quarantine/restore/purge action is appended to
+`<CRD_ROOT>/backups/<project>/.trash-log.jsonl` (one JSON line per action) -
+the delete-side equivalent of the `.conflict_bk` naming convention that
+already records overwrite history.
+
+```bash
+# See what git deleted between the last deploy and now (no flag needed for this part)
+python CheckRemoteDirty.py --workingDir <dir> --vsGit <hashfile> --ftpConfig <cfg> --vsGitListHash "<deployedTag>..HEAD"
+
+# Also quarantine those paths on the remote
+python CheckRemoteDirty.py --workingDir <dir> --vsGit <hashfile> --ftpConfig <cfg> --vsGitListHash "<deployedTag>..HEAD" --pruneDeleted
+
+# Bring one back
+python CheckRemoteDirty.py --workingDir <dir> --ftpConfig <cfg> --restoreFromTrash "some/file.php"
+
+# Preview, then actually purge anything quarantined 30+ days ago
+python CheckRemoteDirty.py --workingDir <dir> --ftpConfig <cfg> --purgeTrash --olderThanDays 30
+python CheckRemoteDirty.py --workingDir <dir> --ftpConfig <cfg> --purgeTrash --olderThanDays 30 --yes
+```
 
 ---
 

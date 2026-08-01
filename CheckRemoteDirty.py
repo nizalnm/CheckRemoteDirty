@@ -142,17 +142,22 @@ def resolve_git_commit(repo_path, commit_ref="HEAD"):
 
 def get_files_changed_in_commit(repo_path, commit_hash):
     """
-    Returns a list of files that were changed (added/modified) in the specified commit_hash.
+    Returns (changed_files, deleted_files) for the specified commit_hash (a
+    single commit or an A..B range). changed_files = added/modified/copied,
+    exactly what this used to return alone. deleted_files is new: paths git
+    says no longer exist at the target - previously invisible to this tool
+    entirely, since --name-only silently drops removed paths. --no-renames
+    is deliberate: without it a rename can show as a single R-status line
+    this parser doesn't understand, and (more importantly) it would hide a
+    real deletion at the old path behind what looks like just a move -
+    treating a rename as a plain delete + add is the conservative, correct
+    choice for a tool whose delete path now does something to the remote.
     """
     try:
-        # Use diff-tree to find changed files in the commit
-        # -r: recurse into subtrees
-        # --no-commit-id: suppress commit ID output
-        # --name-only: show only names of changed files
         if ".." in commit_hash:
             # Handle ranges (e.g., A..B) nicely to just get the net diff
             result = subprocess.run(
-                ["git", "diff", "--name-only", commit_hash],
+                ["git", "diff", "--no-renames", "--name-status", commit_hash],
                 cwd=repo_path,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -161,26 +166,37 @@ def get_files_changed_in_commit(repo_path, commit_hash):
             )
         else:
             result = subprocess.run(
-                ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "-m", commit_hash],
+                ["git", "diff-tree", "--no-commit-id", "--no-renames", "--name-status", "-r", "-m", commit_hash],
                 cwd=repo_path,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 check=True
             )
-        
-        files = []
+
+        changed_files = []
+        deleted_files = []
         ignore_prefixes = ('.agent/', '.agents/', '.beads/', '.ralph-tui/', 'tasks/')
         for line in result.stdout.splitlines():
-            if line.strip():
-                # Handle quoting if present
-                clean_path = line.strip().strip('"')
-                if not clean_path.startswith(ignore_prefixes):
-                    files.append(clean_path)
-        return files
+            line = line.strip()
+            if not line:
+                continue
+            # `git diff --name-status` lines are "<STATUS>\t<path>" (tab-separated).
+            parts = line.split('\t')
+            if len(parts) < 2:
+                continue
+            status, path = parts[0], parts[-1]
+            clean_path = path.strip('"')
+            if clean_path.startswith(ignore_prefixes):
+                continue
+            if status.startswith('D'):
+                deleted_files.append(clean_path)
+            else:
+                changed_files.append(clean_path)
+        return changed_files, deleted_files
     except subprocess.CalledProcessError as e:
         print(f"Error getting files from commit {commit_hash}: {e.stderr}")
-        return []
+        return [], []
 
 def load_json(filepath):
     if not os.path.exists(filepath):
@@ -814,6 +830,407 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
     except Exception as e:
         print(f"FTP Error: {e}")
 
+# ---------------------------------------------------------------------------
+# Deletion support (docs/deletion-support-proposal.md). Three deliberately
+# separate code paths - quarantine (soft delete), restore, purge (hard
+# delete) - each its own FTP connection, never sharing state with the normal
+# upload flow above. See the proposal doc for the full reasoning; the short
+# version: every other operation here is recoverable by re-running against
+# git, a delete is the one operation whose failure mode is data loss, so it
+# gets its own, stricter rules throughout.
+# ---------------------------------------------------------------------------
+
+PROTECTED_BASENAMES = {'.htaccess', 'web.config', '.env'}
+
+def is_path_protected(rel_path):
+    """
+    Hard, non-configurable delete denylist - checked before anything else in
+    the quarantine/restore/purge paths, and never overridable by project
+    config (unlike --exclude, which the quarantine path also respects
+    separately - see process_deleted_files).
+    """
+    norm = rel_path.replace('\\', '/').strip('/')
+    parts = [p for p in norm.split('/') if p not in ('', '.')]
+    if any(p == '..' for p in parts):
+        return True, "path traversal ('..') segment"
+    if parts and parts[0] == '.crd-trash':
+        return True, "inside CRD's own quarantine directory"
+    basename = parts[-1] if parts else norm
+    if basename in PROTECTED_BASENAMES:
+        return True, f"protected filename ({basename})"
+    return False, None
+
+def list_remote_dir(ftp, path):
+    """
+    Returns [(name, is_dir), ...] for the immediate children of `path` on the
+    remote. Tries MLSD (RFC 3659 - structured, tells you the type directly)
+    first; falls back to NLST + a CWD probe per entry for servers that don't
+    support MLSD (common on older/shared FTP hosts). Returns [] if the path
+    doesn't exist or can't be listed - callers should treat that as "nothing
+    here", not an error, since an empty/missing quarantine dir is the normal
+    steady state most of the time.
+    """
+    try:
+        entries = []
+        for name, facts in ftp.mlsd(path):
+            if name in ('.', '..'):
+                continue
+            entries.append((name, facts.get('type') == 'dir'))
+        return entries
+    except (ftplib.error_perm, AttributeError):
+        pass  # MLSD unsupported/denied on this server - fall back below
+
+    try:
+        names = ftp.nlst(path)
+    except ftplib.error_perm:
+        return []
+
+    original_pwd = None
+    try:
+        original_pwd = ftp.pwd()
+    except ftplib.error_perm:
+        pass
+
+    entries = []
+    for full in names:
+        name = full.rsplit('/', 1)[-1]
+        if name in ('.', '..'):
+            continue
+        is_dir = False
+        try:
+            ftp.cwd(full if full.startswith('/') else f"{path}/{name}")
+            is_dir = True
+        except ftplib.error_perm:
+            is_dir = False
+        entries.append((name, is_dir))
+    if original_pwd:
+        try:
+            ftp.cwd(original_pwd)
+        except ftplib.error_perm:
+            pass
+    return entries
+
+def _walk_trash_subtree(ftp, current_path, ts_root, ts_name):
+    """Recursively yields file entries under one .crd-trash/<timestamp>/ batch."""
+    for name, is_dir in list_remote_dir(ftp, current_path):
+        full = f"{current_path}/{name}"
+        if is_dir:
+            yield from _walk_trash_subtree(ftp, full, ts_root, ts_name)
+        else:
+            rel = full[len(ts_root) + 1:]
+            yield {
+                'timestamp': ts_name,
+                'quarantine_path': full,
+                'original_rel_path': rel,
+            }
+
+def walk_remote_trash(ftp, remote_root):
+    """Yields every file currently quarantined under <remote_root>/.crd-trash/, across all timestamp batches."""
+    trash_path = f"{remote_root}/.crd-trash".replace('//', '/')
+    for ts_name, is_dir in list_remote_dir(ftp, trash_path):
+        if not is_dir:
+            continue
+        ts_root = f"{trash_path}/{ts_name}"
+        yield from _walk_trash_subtree(ftp, ts_root, ts_root, ts_name)
+
+def _rmdir_tree(ftp, path):
+    """Best-effort recursive rmdir, deepest-first, for a tree already emptied of files. Never fatal - leftover empty dirs are clutter, not data loss."""
+    for name, is_dir in list_remote_dir(ftp, path):
+        if is_dir:
+            _rmdir_tree(ftp, f"{path}/{name}")
+    try:
+        ftp.rmd(path)
+    except Exception:
+        pass
+
+def append_trash_log(script_dir, project_name, entry):
+    """
+    Append-only audit trail for every quarantine/restore/purge action - the
+    delete-side equivalent of the .conflict_bk naming convention already
+    carrying this information for overwrites. One JSON object per line.
+    """
+    log_dir = os.path.join(script_dir, "backups", project_name)
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, ".trash-log.jsonl")
+    entry = dict(entry)
+    entry.setdefault('logged_at', datetime.datetime.now().isoformat())
+    try:
+        with open(log_path, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        print(f"   >> (note: could not write trash log entry: {e})")
+
+def process_deleted_files(ftp_config_path, working_dir, deleted_rel_paths, triggering_commit=None):
+    """
+    Phase 2: soft-deletes confirmed candidates via an ATOMIC FTP rename into
+    <remote_root>/.crd-trash/<run_timestamp>/<original/rel/path>. The file
+    never stops existing on the server, it just moves - there is no
+    delete-then-realize-it-was-wrong window. Never a hard delete; that only
+    ever happens via the separate --purgeTrash command (cmd_purge_trash), on
+    its own retention window, invoked by a human, never automatically.
+
+    Never called unless --pruneDeleted was explicitly passed (see main());
+    even then, this always shows the confirmed candidate list and requires
+    the operator to type back the count before touching anything remote -
+    deliberately stricter than the ordinary upload confirmation, since this
+    is the one operation whose failure mode is data loss, not staleness.
+    """
+    if not deleted_rel_paths:
+        return
+
+    config = load_json(ftp_config_path)
+    if not config:
+        print(f"Error: Could not load FTP config from {ftp_config_path}")
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_name = os.path.basename(working_dir)
+
+    try:
+        ftp = connect_ftp(config)
+    except Exception as e:
+        print(f"FTP Error (deletion pass): {e}")
+        return
+
+    try:
+        remote_root = config.get('remote_root', '/')
+        run_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        print(f"\n{Colors.WARNING}--- Deletion pass: checking {len(deleted_rel_paths)} git-deleted path(s) against the remote ---{Colors.ENDC}")
+
+        candidates = []
+        for rel_path in deleted_rel_paths:
+            rel_path = rel_path.replace('\\', '/')
+            blocked, reason = is_path_protected(rel_path)
+            if blocked:
+                print(f"  - {rel_path}: SKIPPED (protected: {reason})")
+                continue
+
+            remote_path = f"{remote_root}/{rel_path}".replace('//', '/')
+            try:
+                size = ftp.size(remote_path)
+            except ftplib.error_perm:
+                # Not on the remote (already quarantined by a prior run, never
+                # existed there, or it's a directory - SIZE fails on those too
+                # on most servers) - nothing to do, and that's the normal,
+                # idempotent steady state on a re-run.
+                size = None
+
+            if size is None:
+                continue
+
+            candidates.append({'rel_path': rel_path, 'remote_path': remote_path, 'size': size})
+
+        if not candidates:
+            print("Nothing to quarantine - none of the git-deleted paths are still present on the remote.")
+            return
+
+        print(f"\n--- The following {len(candidates)} file(s) will be moved to quarantine (recoverable via --restoreFromTrash) ---")
+        for c in candidates:
+            print(f"  - {c['rel_path']}  ({c['size']} bytes)")
+
+        confirm = input(f"\nType the number of files to confirm ({len(candidates)}), or Enter to abort: ").strip()
+        if confirm != str(len(candidates)):
+            print("Deletion pass aborted - no files were touched.")
+            return
+
+        quarantined, failed = [], []
+        for c in candidates:
+            rel_path = c['rel_path']
+            quarantine_path = f"{remote_root}/.crd-trash/{run_ts}/{rel_path}".replace('//', '/')
+            try:
+                ensure_remote_dirs(ftp, quarantine_path)
+                ftp.rename(c['remote_path'], quarantine_path)
+                print(f"  >> Quarantined {rel_path} -> .crd-trash/{run_ts}/{rel_path}")
+                quarantined.append(rel_path)
+                append_trash_log(script_dir, project_name, {
+                    'action': 'quarantine',
+                    'original_rel_path': rel_path,
+                    'quarantine_rel_path': f".crd-trash/{run_ts}/{rel_path}",
+                    'triggering_commit': triggering_commit,
+                })
+            except Exception as e:
+                print(f"  >> FAILED to quarantine {rel_path}: {e}")
+                failed.append(rel_path)
+
+        print(f"\nQuarantined {len(quarantined)}/{len(candidates)} file(s).")
+        if failed:
+            print("The following failed and are still live at their original path (re-run to retry):")
+            for f in failed:
+                print(f"  - {f}")
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+
+def cmd_restore_from_trash(ftp_config_path, working_dir, pattern):
+    """
+    Phase 3: lists .crd-trash/ entries whose original path matches `pattern`
+    (fnmatch, or a plain substring match as a convenience for "just the
+    filename"), newest quarantine batch first, and moves the chosen one back
+    to its original location via the same atomic rename used to quarantine
+    it. This is what makes the soft delete actually rollbackable, not just
+    "backed up somewhere you could theoretically recover by hand."
+    """
+    if not ftp_config_path:
+        print("Error: --ftpConfig is required for --restoreFromTrash.")
+        sys.exit(1)
+
+    config = load_json(ftp_config_path)
+    if not config:
+        print(f"Error: Could not load FTP config from {ftp_config_path}")
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_name = os.path.basename(working_dir)
+
+    try:
+        ftp = connect_ftp(config)
+    except Exception as e:
+        print(f"FTP Error: {e}")
+        return
+
+    try:
+        remote_root = config.get('remote_root', '/')
+        print(f"Scanning .crd-trash/ for entries matching '{pattern}'...")
+        matches = [
+            e for e in walk_remote_trash(ftp, remote_root)
+            if fnmatch.fnmatch(e['original_rel_path'], pattern) or pattern in e['original_rel_path']
+        ]
+        matches.sort(key=lambda e: e['timestamp'], reverse=True)  # lexical sort = newest first (YYYYMMDD_HHMMSS)
+
+        if not matches:
+            print("No matching quarantined files found.")
+            return
+
+        if len(matches) == 1:
+            chosen = matches[0]
+        else:
+            print(f"\n{len(matches)} matching quarantined file(s), newest first:")
+            for i, e in enumerate(matches, 1):
+                print(f"  [{i}] {e['original_rel_path']}  (quarantined {e['timestamp']})")
+            choice = input("Pick a number, or Enter to abort: ").strip()
+            if not choice.isdigit() or not (1 <= int(choice) <= len(matches)):
+                print("Aborted.")
+                return
+            chosen = matches[int(choice) - 1]
+
+        original_path = f"{remote_root}/{chosen['original_rel_path']}".replace('//', '/')
+
+        try:
+            existing_size = ftp.size(original_path)
+        except ftplib.error_perm:
+            existing_size = None
+        if existing_size is not None:
+            confirm = input(
+                f"WARNING: a file already exists at {chosen['original_rel_path']} on the remote. "
+                f"Overwrite it with the restored version? (y/N): "
+            ).strip().lower()
+            if confirm != 'y':
+                print("Aborted - remote file left unchanged.")
+                return
+
+        ensure_remote_dirs(ftp, original_path)
+        ftp.rename(chosen['quarantine_path'], original_path)
+        print(f"Restored {chosen['original_rel_path']} (from quarantine timestamp {chosen['timestamp']}).")
+
+        append_trash_log(script_dir, project_name, {
+            'action': 'restore',
+            'original_rel_path': chosen['original_rel_path'],
+            'quarantine_rel_path': chosen['quarantine_path'],
+        })
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+
+def cmd_purge_trash(ftp_config_path, working_dir, older_than_days, confirm=False):
+    """
+    Phase 4: permanently removes .crd-trash/<timestamp>/ batches older than
+    older_than_days. Dry-run (lists what WOULD be purged) unless confirm=True
+    (--yes) is also passed. This is the one genuinely unrecoverable operation
+    in the whole design, so it's the most separate: its own command, its own
+    confirmation, and only ever reachable for files that already survived a
+    full quarantine cycle - never a direct hard delete from anywhere else.
+    """
+    if not ftp_config_path:
+        print("Error: --ftpConfig is required for --purgeTrash.")
+        sys.exit(1)
+
+    config = load_json(ftp_config_path)
+    if not config:
+        print(f"Error: Could not load FTP config from {ftp_config_path}")
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    project_name = os.path.basename(working_dir)
+
+    try:
+        ftp = connect_ftp(config)
+    except Exception as e:
+        print(f"FTP Error: {e}")
+        return
+
+    try:
+        remote_root = config.get('remote_root', '/')
+        trash_path = f"{remote_root}/.crd-trash".replace('//', '/')
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=older_than_days)
+
+        stale_ts = []
+        for ts_name, is_dir in list_remote_dir(ftp, trash_path):
+            if not is_dir:
+                continue
+            try:
+                ts_dt = datetime.datetime.strptime(ts_name, "%Y%m%d_%H%M%S")
+            except ValueError:
+                continue  # not a batch this tool created - never touch it
+            if ts_dt < cutoff:
+                stale_ts.append(ts_name)
+
+        if not stale_ts:
+            print(f"Nothing in .crd-trash/ older than {older_than_days} day(s). Nothing to purge.")
+            return
+
+        print(f"\n--- {len(stale_ts)} quarantine batch(es) older than {older_than_days} day(s) ---")
+        all_files = []
+        for ts_name in sorted(stale_ts):
+            ts_root = f"{trash_path}/{ts_name}"
+            files = list(_walk_trash_subtree(ftp, ts_root, ts_root, ts_name))
+            print(f"  {ts_name}: {len(files)} file(s)")
+            for f in files:
+                print(f"    - {f['original_rel_path']}")
+            all_files.extend(files)
+
+        if not confirm:
+            print(f"\nDry run only - pass --yes to permanently purge these {len(all_files)} file(s). This cannot be undone.")
+            return
+
+        print(f"\nPermanently deleting {len(all_files)} file(s) across {len(stale_ts)} batch(es)...")
+        deleted_count = 0
+        for f in all_files:
+            try:
+                ftp.delete(f['quarantine_path'])
+                deleted_count += 1
+                append_trash_log(script_dir, project_name, {
+                    'action': 'purge',
+                    'original_rel_path': f['original_rel_path'],
+                    'quarantine_rel_path': f['quarantine_path'],
+                })
+            except Exception as e:
+                print(f"  >> FAILED to delete {f['quarantine_path']}: {e}")
+
+        for ts_name in sorted(stale_ts):
+            _rmdir_tree(ftp, f"{trash_path}/{ts_name}")
+
+        print(f"Purged {deleted_count}/{len(all_files)} file(s).")
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+
 def main():
     parser = argparse.ArgumentParser(description="CheckStagingDirty: Check local git dirty state vs remote FTP.")
     
@@ -824,7 +1241,9 @@ def main():
     mode_group.add_argument("--vsGit", "--vsgit", dest="vsGit", help="Path to create/overwrite hashfile based on current git dirty files.")
     mode_group.add_argument("--vsHashFile", "--vshashfile", dest="vsHashFile", help="Path to existing hashfile to compare against.")
     mode_group.add_argument("--updateHashFile", "--updatehashfile", dest="updateHashFile", help="Update existing hashfile with current git dirty files' hash/timestamp.")
-    
+    mode_group.add_argument("--restoreFromTrash", "--restorefromtrash", dest="restoreFromTrash", help="Mode: restore a quarantined file (fnmatch pattern or substring against its original path) from .crd-trash back to its original remote location.")
+    mode_group.add_argument("--purgeTrash", "--purgetrash", dest="purgeTrash", action="store_true", help="Mode: permanently remove .crd-trash/ batches older than --olderThanDays. Dry-run (lists only) unless --yes is also passed - this is the one unrecoverable operation in the deletion-support design.")
+
     parser.add_argument("--ftpConfig", "--ftpconfig", dest="ftpConfig", help="Path to FTP config JSON file.")
     parser.add_argument("--checkSizeOnly", "--checksizeonly", dest="checkSizeOnly", action="store_true", help="If set, only compares file sizes. Faster but less accurate regarding content equality (ignores line endings issues).")
     parser.add_argument("--deployOnClean", "--deployonclean", dest="deployOnClean", action="store_true", help="If set, attempts to deploy files if remote is clean (matches Git HEAD or missing).")
@@ -832,6 +1251,9 @@ def main():
     parser.add_argument("--vsGitListHash", "--vsgitlisthash", dest="vsGitListHash", help="Optional. A second git commit hash to derive the list of files to be checked. If provided, the reference content will still be pulled from --gitCommitHash (or HEAD).")
     parser.add_argument("--gitBaselineHash", "--gitbaselinehash", dest="gitBaselineHash", help="Optional. Treat this git commit as the 'expected' state of the remote server. If a remote file matches this version, it is considered safe to overwrite (changes are clean).")
     parser.add_argument("--exclude", "--Exclude", dest="exclude", action="append", default=[], help="Glob pattern (fnmatch-style, matched against the git-relative path) to drop from the file list before any FTP check/deploy. Repeatable. Files still stay tracked in git - this only skips them for this tool's remote comparison/deploy, on top of the fixed .agent(s)//.beads//.ralph-tui//tasks/ exclusion in get_files_changed_in_commit().")
+    parser.add_argument("--pruneDeleted", "--prunedeleted", dest="pruneDeleted", action="store_true", help="If set (with --vsGit + --vsGitListHash or --gitCommitHash), offers paths git shows as deleted for quarantine into .crd-trash/ on the remote, after the normal upload pass. Off by default - deletions are only ever reported, never acted on, unless this is explicitly passed. See docs/deletion-support-proposal.md.")
+    parser.add_argument("--olderThanDays", "--olderthandays", dest="olderThanDays", type=int, default=30, help="For --purgeTrash: only consider quarantine batches at least this many days old. Default 30.")
+    parser.add_argument("--yes", dest="yes", action="store_true", help="For --purgeTrash only: actually perform the permanent purge instead of a dry-run listing. Has no effect on any other mode - the quarantine (soft-delete) confirmation always requires typing back the file count, with no bypass.")
 
     args = parser.parse_args()
     working_dir = os.path.abspath(args.workingDir)
@@ -840,22 +1262,38 @@ def main():
         print(f"Error: Working directory {working_dir} does not exist.")
         sys.exit(1)
 
+    # Deletion-support standalone modes (restore / purge) - handled up front,
+    # entirely separate from the normal vsGit/vsHashFile/updateHashFile flow
+    # below (no dirty-file scan, no hashfile writes, own FTP connection).
+    if args.restoreFromTrash:
+        cmd_restore_from_trash(args.ftpConfig, working_dir, args.restoreFromTrash)
+        return
+    if args.purgeTrash:
+        cmd_purge_trash(args.ftpConfig, working_dir, args.olderThanDays, confirm=args.yes)
+        return
+
     affected_files_data = []
 
     # MODE: vsGit
+    deleted_files = []
+
     if args.vsGit:
         if args.vsGitListHash:
             print(f"Scanning for files changed in commit {args.vsGitListHash}...")
-            dirty_files = get_files_changed_in_commit(working_dir, args.vsGitListHash)
+            dirty_files, deleted_files = get_files_changed_in_commit(working_dir, args.vsGitListHash)
         else:
             print(f"Scanning for dirty files in {working_dir}...")
             dirty_files = get_git_dirty_files(working_dir)
-            
+            # Deletion detection needs a git range to diff against - the plain
+            # `git status` scan above has no baseline/target pair to derive
+            # "removed since X" from, so it's out of scope for this mode.
+            # Use --vsGitListHash (or --gitCommitHash below) for delete detection.
+
             # If a specific commit hash is provided, also include changed files from that commit
             if args.gitCommitHash:
                 print(f"Scanning for files changed in commit {args.gitCommitHash}...")
-                commit_files = get_files_changed_in_commit(working_dir, args.gitCommitHash)
-                
+                commit_files, deleted_files = get_files_changed_in_commit(working_dir, args.gitCommitHash)
+
                 # Add unique files to the list
                 existing_files = set(dirty_files)
                 added_count = 0
@@ -864,7 +1302,7 @@ def main():
                         dirty_files.append(f)
                         existing_files.add(f)
                         added_count += 1
-                
+
                 if added_count > 0:
                     print(f"Added {added_count} files from commit {args.gitCommitHash}.")
                 elif not dirty_files:
@@ -876,6 +1314,21 @@ def main():
             skipped = before_count - len(dirty_files)
             if skipped:
                 print(f"Excluded {skipped} file(s) matching --exclude pattern(s): {', '.join(args.exclude)}")
+
+            before_del_count = len(deleted_files)
+            deleted_files = [f for f in deleted_files if not any(fnmatch.fnmatch(f, pat) for pat in args.exclude)]
+            skipped_del = before_del_count - len(deleted_files)
+            if skipped_del:
+                print(f"Excluded {skipped_del} deleted file(s) matching --exclude pattern(s) (never a prune candidate).")
+
+        if deleted_files:
+            print(f"\n{Colors.WARNING}--- {len(deleted_files)} file(s) deleted in git (not yet reflected on the remote) ---{Colors.ENDC}")
+            for f in deleted_files:
+                print(f"  - {f}")
+            if args.pruneDeleted:
+                print("--pruneDeleted is set: these will be offered for quarantine after the upload pass.")
+            else:
+                print("Not removed from the remote (pass --pruneDeleted to quarantine them there too).")
 
         # Load existing persistence data
         existing_data = load_json(args.vsGit) or []
@@ -1077,6 +1530,12 @@ def main():
             compare_with_ftp(args.ftpConfig, affected_files_data, check_size_only=args.checkSizeOnly, deploy_on_clean=args.deployOnClean, working_dir=working_dir, hash_file_path=hash_file_path, baseline_hash_ref=args.gitBaselineHash)
         else:
             print("No file data to compare with FTP.")
+
+        # Deletion pass - deliberately its own FTP connection, run only after
+        # the normal upload pass above has fully finished, and only ever when
+        # --pruneDeleted was explicitly passed (see docs/deletion-support-proposal.md).
+        if args.pruneDeleted and deleted_files:
+            process_deleted_files(args.ftpConfig, working_dir, deleted_files, triggering_commit=args.vsGitListHash or args.gitCommitHash)
 
 if __name__ == "__main__":
     main()
