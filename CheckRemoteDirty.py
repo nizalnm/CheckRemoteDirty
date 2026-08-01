@@ -8,6 +8,7 @@ import ftplib
 import datetime
 import sys
 import io
+import fnmatch
 from ftplib import FTP_TLS
 
 class Colors:
@@ -509,6 +510,9 @@ def compare_with_ftp(ftp_config_path, file_data_list, check_size_only=False, dep
                     if user_input in ['r', 'replace']:
                         user_input = 'replace'
 
+                    if user_input in ['k', 'keep']:
+                        user_input = 'keep'
+
                     if user_input == 'replace':
                         deployable_candidates.append({
                             "item_ref": item,
@@ -827,6 +831,7 @@ def main():
     parser.add_argument("--gitCommitHash", "--gitcommithash", dest="gitCommitHash", help="Optional. The git commit hash (or ref) to compare against. Defaults to 'HEAD'.")
     parser.add_argument("--vsGitListHash", "--vsgitlisthash", dest="vsGitListHash", help="Optional. A second git commit hash to derive the list of files to be checked. If provided, the reference content will still be pulled from --gitCommitHash (or HEAD).")
     parser.add_argument("--gitBaselineHash", "--gitbaselinehash", dest="gitBaselineHash", help="Optional. Treat this git commit as the 'expected' state of the remote server. If a remote file matches this version, it is considered safe to overwrite (changes are clean).")
+    parser.add_argument("--exclude", "--Exclude", dest="exclude", action="append", default=[], help="Glob pattern (fnmatch-style, matched against the git-relative path) to drop from the file list before any FTP check/deploy. Repeatable. Files still stay tracked in git - this only skips them for this tool's remote comparison/deploy, on top of the fixed .agent(s)//.beads//.ralph-tui//tasks/ exclusion in get_files_changed_in_commit().")
 
     args = parser.parse_args()
     working_dir = os.path.abspath(args.workingDir)
@@ -864,7 +869,14 @@ def main():
                     print(f"Added {added_count} files from commit {args.gitCommitHash}.")
                 elif not dirty_files:
                     print(f"No changed files found in commit {args.gitCommitHash}.")
-        
+
+        if args.exclude:
+            before_count = len(dirty_files)
+            dirty_files = [f for f in dirty_files if not any(fnmatch.fnmatch(f, pat) for pat in args.exclude)]
+            skipped = before_count - len(dirty_files)
+            if skipped:
+                print(f"Excluded {skipped} file(s) matching --exclude pattern(s): {', '.join(args.exclude)}")
+
         # Load existing persistence data
         existing_data = load_json(args.vsGit) or []
         existing_map = {item['path']: item for item in existing_data}
