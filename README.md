@@ -210,6 +210,24 @@ unresolvable conflict. That's fixed, deliberately conservatively: **nothing
 is ever deleted outright.** See `docs/deletion-support-proposal.md` for the
 full design reasoning; the short version:
 
+> **Setup requirement — add an explicit deny rule for `.crd-trash/` to your
+> project's own web-server config before your first `--pruneDeleted` run.**
+> Don't assume it's unreachable by default: whether a freshly-created
+> directory at the docroot ends up 403/blocked or actually servable depends
+> on host-specific rewrite-rule interactions and directory-listing defaults
+> that are easy to get wrong and easy to never notice you got wrong (see the
+> widgetco incident this was caught on — a directory that only "happened"
+> to be blocked, not deliberately). Apache example, same pattern as any
+> other deny-listed path:
+> ```apache
+> RewriteRule ^\.crd-trash/ - [F,L]
+> ```
+> nginx: a `location ^~ /.crd-trash/ { deny all; }` block. IIS: a
+> `web.config` `<authorization>` deny rule scoped to that path. If the
+> project mirrors its `.htaccess` into a separate WHM/hosting-panel
+> `hardening.conf` or similar, update that too — CRD can't do this for you,
+> since it only ever touches files inside the git-tracked project.
+
 1. **Detection is always on, action is always opt-in.** When you run with
    `--vsGitListHash <A..B>` (or `--gitCommitHash`), any path git shows as
    removed between those two points is reported - printed plainly, every
