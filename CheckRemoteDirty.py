@@ -46,6 +46,41 @@ def get_file_timestamp(filepath):
     except FileNotFoundError:
         return None
 
+def get_git_repo_root(working_dir):
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=working_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True
+        )
+        return os.path.abspath(result.stdout.strip())
+    except Exception:
+        return None
+
+def adjust_paths_to_working_dir(paths, working_dir):
+    git_root = get_git_repo_root(working_dir)
+    if not git_root:
+        return paths
+    
+    try:
+        rel_sub = os.path.relpath(os.path.abspath(working_dir), git_root)
+        if rel_sub == '.' or rel_sub == './' or not rel_sub:
+            return paths
+        rel_sub = rel_sub.replace('\\', '/')
+    except Exception:
+        return paths
+        
+    adjusted_paths = []
+    prefix = rel_sub + '/'
+    for p in paths:
+        p_norm = p.replace('\\', '/')
+        if p_norm.startswith(prefix):
+            adjusted_paths.append(p_norm[len(prefix):])
+    return adjusted_paths
+
 def get_git_dirty_files(working_dir):
     """
     Returns a list of relative file paths that are dirty (modified/added) 
@@ -73,7 +108,7 @@ def get_git_dirty_files(working_dir):
                 path = line[3:].strip('"')
                 dirty_files.append(path)
                 
-        return dirty_files
+        return adjust_paths_to_working_dir(dirty_files, working_dir)
     except subprocess.CalledProcessError as e:
         print(f"Error running git status: {e.stderr}")
         sys.exit(1)
@@ -89,6 +124,8 @@ def get_git_file_content(repo_path, rel_path, commit_ref="HEAD"):
     try:
         # Use simple forward slashes for git pathspec
         git_path = rel_path.replace('\\', '/')
+        if not git_path.startswith('./'):
+            git_path = './' + git_path
         result = subprocess.run(
             ["git", "show", f"{commit_ref}:{git_path}"],
             cwd=repo_path,
@@ -193,7 +230,10 @@ def get_files_changed_in_commit(repo_path, commit_hash):
                 deleted_files.append(clean_path)
             else:
                 changed_files.append(clean_path)
-        return changed_files, deleted_files
+        return (
+            adjust_paths_to_working_dir(changed_files, repo_path),
+            adjust_paths_to_working_dir(deleted_files, repo_path)
+        )
     except subprocess.CalledProcessError as e:
         print(f"Error getting files from commit {commit_hash}: {e.stderr}")
         return [], []
@@ -201,8 +241,11 @@ def get_files_changed_in_commit(repo_path, commit_hash):
 def load_json(filepath):
     if not os.path.exists(filepath):
         return None
-    with open(filepath, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return None
 
 def save_json(filepath, data):
     with open(filepath, 'w', encoding='utf-8') as f:
