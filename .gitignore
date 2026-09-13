@@ -2,6 +2,8 @@
 # Ignore all json files (config and metadata)
 *.json
 !sample_ftp_config.json
+!.claude/skills/crd-deploy-workflow/assets/sample_workflow_config.json
+!.claude/skills/merge-from-crd-backup/evals/evals.json
 __pycache__/
 *.pyc
 

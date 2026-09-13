@@ -1,0 +1,37 @@
+{
+  "skill_name": "merge-from-crd-backup",
+  "evals": [
+    {
+      "id": 0,
+      "eval_name": "config-php-crlf-noise-and-local-only-secret",
+      "prompt": "merge from crd backup C:\\www\\CheckRemoteDirty\\backups\\widgetco\\config\\config.php.20260624_075623.conflict_bk",
+      "expected_output": "Recognizes the backup is CRLF and local is LF, so the raw diff showing all 207 lines changed is noise. The only real difference is a local-only 'key' block (HMAC signing secret + 2 comment lines) that postdates the backup. Correct outcome: keep local, adopt nothing, leave the working file byte-identical to HEAD. Must NOT delete the 'key' block. Must not echo the secret value.",
+      "files": [],
+      "assertions": [
+        "Chose the 20260624_075623.conflict_bk backup as newest of the 7 candidates",
+        "Explicitly identified the CRLF-vs-LF line-ending difference and normalized before diffing",
+        "Did not conclude the file was rewritten wholesale",
+        "Preserved the local-only 'key' block (HMAC secret) rather than deleting it to match remote",
+        "Left the working file byte-identical to HEAD (no net change)",
+        "Did not print the literal secret value of the 'key' entry in the report",
+        "Reported both verification pivots (vs baseline, vs backup)"
+      ]
+    },
+    {
+      "id": 1,
+      "eval_name": "admin-index-adopt-remote-join-fix-skip-reindent",
+      "prompt": "the server has changes to public/admin/index.php that never got committed - merge them into my local copy from the crd backup",
+      "expected_output": "Locates the backup from the working-file path. Normalized diff has 3 hunks: two SQL JOINs where remote changed enrollments.cohort_id = c.cohort_id to enrollments.offering_id = c.id (a genuine remote bugfix, since joining at cohort level overcounts enrollees across sibling offerings), plus one pure reindentation of the $adminPageBadge block. Correct outcome: adopt both JOIN fixes, skip the reindent, keep LF line endings.",
+      "files": [],
+      "assertions": [
+        "Located the correct backup (index.php.20260709_153437.conflict_bk) from only the working-file path",
+        "Adopted the remote JOIN fix in BOTH the 'ongoing' and 'completed' queries",
+        "Justified the JOIN fix against the schema rather than adopting it blindly",
+        "Skipped the cosmetic reindentation hunk instead of adopting it",
+        "Working file remains LF-terminated (did not adopt the backup's CRLF)",
+        "Net change to the working file is exactly 2 lines changed",
+        "Reported both verification pivots (vs baseline, vs backup)"
+      ]
+    }
+  ]
+}

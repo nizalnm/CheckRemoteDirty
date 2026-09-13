@@ -1,0 +1,12 @@
+{
+  "project": "myproject",
+  "workingDir": "C:\\www\\myproject",
+  "mirrorBranch": "staging",
+  "deployBranch": "staging",
+  "deployedTag": "latest-staging-deployed",
+  "dirtyCheckFile": "myproject_dirty_check.json",
+  "ftpConfig": "myproject_config.json",
+  "stage1StateFile": "myproject_stage1_state.json",
+  "gitRemote": "origin",
+  "excludePatterns": ["cache/*", "*.log", "Thumbs.db"]
+}
