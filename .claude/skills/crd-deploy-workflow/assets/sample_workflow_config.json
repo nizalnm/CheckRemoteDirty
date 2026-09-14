@@ -8,5 +8,7 @@
   "ftpConfig": "myproject_config.json",
   "stage1StateFile": "myproject_stage1_state.json",
   "gitRemote": "origin",
-  "excludePatterns": ["cache/*", "*.log", "Thumbs.db"]
+  "excludePatterns": ["cache/*", "*.log", "Thumbs.db"],
+  "remoteManifestUrl": "https://myproject.example.com/_crd_stage1_scan.php",
+  "remoteManifestSecret": "REPLACE_WITH_THE_SAME_FRESH_SECRET_BAKED_INTO_THE_DEPLOYED_SCANNER"
 }

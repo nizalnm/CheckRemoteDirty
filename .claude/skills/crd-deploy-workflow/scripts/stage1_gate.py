@@ -24,25 +24,55 @@ other CRD files (ftpConfig, dirtyCheckFile) — pass its path with
 --state-file. Missing file == fresh state (gate defaults to "run", since
 there's no record of a first-of-day run yet).
 
+The same sidecar also carries `mtimeWatermark` — the raw YYYYMMDDHHMMSS (UTC)
+cutoff scan_remote_vs_local.py's --mtime-cutoff uses to skip re-fetching
+content for tracked files that haven't changed on the remote since the last
+clean run (see that script's own docstring for the mechanism). It starts
+unset (null), which simply means "no cutoff yet — check everything," the
+same as running without --mtime-cutoff at all.
+
+A third, independent field, `remoteManifestLastMtime`, carries the last
+known-clean root mtime from remote_manifest_precheck.py — a DIFFERENT
+optimization (a remote-side PHP scanner deployed under the project's own web
+root, for projects that have one; see that script's own docstring) that can
+skip or narrow the FTP walk itself, not just skip re-fetching content within
+it. Like mtimeWatermark it starts unset (null); use --set-remote-manifest-mtime
+to advance it (see Modes below) after a precheck run that left nothing
+unresolved.
+
 Usage:
     stage1_gate.py --state-file acmeapp_stage1_state.json --check
     stage1_gate.py --state-file acmeapp_stage1_state.json --record-run --outcome clean
+    stage1_gate.py --state-file acmeapp_stage1_state.json --record-run --outcome clean --new-watermark 20260914120000
     stage1_gate.py --state-file acmeapp_stage1_state.json --record-run --outcome drift
     stage1_gate.py --state-file acmeapp_stage1_state.json --record-external-drift
+    stage1_gate.py --state-file acmeapp_stage1_state.json --set-remote-manifest-mtime 1789394497
 
 Modes:
     --check
         Reports whether Stage 1 should run this cycle, and why. Does not
         modify state. Exit 0 either way; read the JSON/text "should_run"
-        field, don't rely on exit code for the decision.
+        field, don't rely on exit code for the decision. The current
+        mtimeWatermark (possibly null) is always included in the "state"
+        sub-object of the output — pass it as scan_remote_vs_local.py's
+        --mtime-cutoff when should_run is true.
 
-    --record-run --outcome clean|drift
+    --record-run --outcome clean|drift [--new-watermark VALUE]
         Call after Stage 1 actually ran this cycle, with what it found.
         Always stamps lastRunDate = today (the daily gate looks at this).
-        outcome=drift: activates enforcement and resets the clean streak to 0.
+        outcome=drift: activates enforcement and resets the clean streak to 0;
+        --new-watermark is rejected here (a drift run means something out
+        there wasn't caught by the old watermark — never advance it on the
+        same run that found that).
         outcome=clean: if enforcement is active, increments the clean streak
         and deactivates enforcement once it reaches 3; if enforcement was not
         active, this is just a normal once-a-day clean run (no streak kept).
+        Pass --new-watermark (scan_remote_vs_local.py's own suggested value,
+        printed at the end of a run that left nothing unresolved) to advance
+        mtimeWatermark; omit it — e.g. the scan found modified/missing-locally
+        files it couldn't safely call "fully accounted for" — and the stored
+        watermark is left exactly as it was, so next run still fully checks
+        whatever this run left unresolved.
 
     --record-external-drift
         Call when a LATER stage (Stage 4's CRD preflight, typically) finds an
@@ -52,6 +82,18 @@ Modes:
         cycle. The workflow should treat this as "go back and run Stage 1
         right now, for this same deployment, as an immediate precaution" —
         then call --record-run with that scan's outcome afterward.
+
+    --set-remote-manifest-mtime VALUE
+        Advance remoteManifestLastMtime to VALUE (an integer unix
+        timestamp — remote_manifest_precheck.py's own remote_root_mtime
+        field). Call this after a precheck run whose remote_available was
+        true and which either skipped the walk entirely or successfully
+        pruned it — i.e. one whose result you trust as a clean, current
+        read of the remote root. Never call it when remote_available was
+        false (the precheck couldn't reach the scanner at all) — that would
+        advance the baseline past a cycle nothing was actually verified in.
+        Independent of --record-run/--outcome; does not touch lastRunDate,
+        enforcementActive, or cleanStreak.
 """
 
 from __future__ import annotations
@@ -68,6 +110,8 @@ DEFAULT_STATE = {
     "lastRunDate": None,
     "enforcementActive": False,
     "cleanStreak": 0,
+    "mtimeWatermark": None,
+    "remoteManifestLastMtime": None,
 }
 
 
@@ -114,7 +158,7 @@ def do_check(state):
     }
 
 
-def do_record_run(state, outcome):
+def do_record_run(state, outcome, new_watermark=None):
     state["lastRunDate"] = today_str()
     if outcome == "drift":
         state["enforcementActive"] = True
@@ -122,6 +166,9 @@ def do_record_run(state, outcome):
         return {"enforcementActive": True, "cleanStreak": 0, "detail": "drift found - enforcement (re)activated"}
 
     # outcome == "clean"
+    if new_watermark:
+        state["mtimeWatermark"] = new_watermark
+
     if state["enforcementActive"]:
         state["cleanStreak"] += 1
         if state["cleanStreak"] >= CLEAN_STREAK_TO_DISABLE:
@@ -161,22 +208,38 @@ def main(argv=None):
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--record-run", action="store_true")
     mode.add_argument("--record-external-drift", action="store_true")
+    mode.add_argument("--set-remote-manifest-mtime", default=None, metavar="VALUE",
+                       help="advance remoteManifestLastMtime to this integer unix timestamp "
+                            "(remote_manifest_precheck.py's remote_root_mtime) - independent of "
+                            "the gate/enforcement fields")
     p.add_argument("--outcome", choices=["clean", "drift"], help="required with --record-run")
+    p.add_argument("--new-watermark", default=None,
+                   help="raw YYYYMMDDHHMMSS (UTC) to advance mtimeWatermark to - only valid "
+                        "with --record-run --outcome clean (see scan_remote_vs_local.py's "
+                        "suggested_new_watermark output)")
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
 
     if args.record_run and not args.outcome:
         p.error("--record-run requires --outcome clean|drift")
+    if args.new_watermark and not (args.record_run and args.outcome == "clean"):
+        p.error("--new-watermark is only valid with --record-run --outcome clean")
+    if args.set_remote_manifest_mtime is not None and not args.set_remote_manifest_mtime.lstrip("-").isdigit():
+        p.error("--set-remote-manifest-mtime must be an integer unix timestamp")
 
     state = load_state(args.state_file)
 
     if args.check:
         result = do_check(state)
     elif args.record_run:
-        result = do_record_run(state, args.outcome)
+        result = do_record_run(state, args.outcome, new_watermark=args.new_watermark)
+        save_state(args.state_file, state)
+    elif args.record_external_drift:
+        result = do_record_external_drift(state)
         save_state(args.state_file, state)
     else:
-        result = do_record_external_drift(state)
+        state["remoteManifestLastMtime"] = args.set_remote_manifest_mtime
+        result = {"detail": f"remoteManifestLastMtime set to {args.set_remote_manifest_mtime}"}
         save_state(args.state_file, state)
 
     result["state"] = state

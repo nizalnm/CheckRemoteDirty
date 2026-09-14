@@ -41,10 +41,11 @@ for the template:
 ```
 
 `stage1StateFile` names the small JSON sidecar `scripts/stage1_gate.py` uses to
-track Stage 1's daily-scan gate and drift-triggered enforcement window (see
-Stage 1 below). It lives next to `ftpConfig`/`dirtyCheckFile` under
-`CRD_ROOT`, same as those. If omitted, defaults to `<project>_stage1_state.json`.
-Missing file == fresh state, so it doesn't need to be created up front.
+track Stage 1's daily-scan gate, drift-triggered enforcement window, and
+mtime watermark for skipping unchanged-file re-checks (see Stage 1 below). It
+lives next to `ftpConfig`/`dirtyCheckFile` under `CRD_ROOT`, same as those. If
+omitted, defaults to `<project>_stage1_state.json`. Missing file == fresh
+state, so it doesn't need to be created up front.
 
 **`mirrorBranch` and `deployBranch` are two different jobs that happen to be
 the same branch in some projects, but not all.**
@@ -206,8 +207,9 @@ python <this skill>/scripts/stage1_gate.py --state-file <stage1StateFile> --chec
 
 Read `should_run` from the output:
 
-- **`true`** — run the scan below as usual, then record what it found:
-  `python <this skill>/scripts/stage1_gate.py --state-file <stage1StateFile> --record-run --outcome clean` if it found no orphans/modified files, or `--outcome drift` if it did. Recording `drift` (re)activates the enforcement window and resets the clean-streak to 0 — say so to the user briefly ("drift found — Stage 1 will run every deploy until 3 clean scans in a row").  Recording `clean` while enforcement is active advances the streak, and lifts enforcement once it hits 3 (the tool reports which happened — surface it: e.g. "2/3 clean scans, still enforcing" or "3 clean scans reached — back to once-daily").
+- **`true`** — run the scan below as usual (passing `--mtime-cutoff` from the
+  gate's current `mtimeWatermark` — see below), then record what it found:
+  `python <this skill>/scripts/stage1_gate.py --state-file <stage1StateFile> --record-run --outcome clean` if it found no orphans/modified/missing-locally files, or `--outcome drift` if it did. Recording `drift` (re)activates the enforcement window and resets the clean-streak to 0 — say so to the user briefly ("drift found — Stage 1 will run every deploy until 3 clean scans in a row").  Recording `clean` while enforcement is active advances the streak, and lifts enforcement once it hits 3 (the tool reports which happened — surface it: e.g. "2/3 clean scans, still enforcing" or "3 clean scans reached — back to once-daily"). When the scan's own output includes a `suggested_new_watermark` (only present on a run that left nothing unresolved), pass it along as `--new-watermark <value>` on this same `--record-run` call — see the watermark paragraph below for why.
 - **`false`** — skip straight to Stage 4 for this deploy. Say so plainly
   ("already scanned today, skipping Stage 1") so the user isn't left assuming
   it ran.
@@ -226,6 +228,36 @@ This activates the enforcement window immediately. Then, as a precaution for
 exactly as above — don't wait for the next deploy to actually run the scan
 that enforcement is meant to trigger.
 
+**Speeding up repeat scans with `--mtime-cutoff` (the mtime watermark):** on
+a project where most of the tracked tree is vendored/third-party code that's
+effectively never hand-edited on the server (a large `node_modules`,
+`vendor`, or bundled-plugins tree — see mirosv2's case, ~91% of its tracked
+files), the expensive part of a repeat scan isn't the directory listing, it's
+downloading and comparing the full content of every one of those files over
+and over on every run. The FTP directory listing this stage already does
+(MLSD) returns each file's own remote modify-time for free in the same
+response — `scan_remote_vs_local.py` now uses that to skip the
+download+compare entirely for any tracked file whose remote mtime predates
+`--mtime-cutoff`, on the theory that nothing has touched it since the last
+run that actually verified it. Unlike `excludePatterns`, this is not a
+permanent blind spot and carries no deploy-safety tradeoff: the directory
+walk itself is untouched (a new file anywhere is still discovered as an
+orphan), and a file that's genuinely edited again gets a newer mtime, so it
+naturally drops back out of "skip" on the very next scan.
+
+Pass the gate's current `mtimeWatermark` (from the `--check` call above, in
+its `state` object — `null` until the first watermark-advancing run) as
+`--mtime-cutoff` on every Stage 1 invocation once it's non-null. After the
+scan, only advance the watermark when it left nothing unresolved — pass its
+own `suggested_new_watermark` field (present only on such a run; `null` if
+any `modified`/`missing_locally` entries remain) to
+`stage1_gate.py --record-run --outcome clean --new-watermark <value>`, per
+the paragraph above. Never invent or advance the watermark by hand
+(`date`, "now", etc.) — always the value the scan itself reports, since it's
+computed from *when the scan started*, not when it finished, which is what
+makes the safety argument (a file touched mid-scan is never wrongly treated
+as covered) hold.
+
 The server can diverge from git in two different ways, and CRD's own diffing
 only ever catches files git already knows to be dirty — it can't see either of
 these on its own:
@@ -237,7 +269,7 @@ these on its own:
   whitespace, the kind of noise a plain byte diff would wrongly flag.
 
 ```bash
-python <this skill>/scripts/scan_remote_vs_local.py --ftp-config <ftpConfig> --working-dir <workingDir> --ref <mirrorBranch> --baseline-ref <deployedTag> --exclude "<pattern>" ...
+python <this skill>/scripts/scan_remote_vs_local.py --ftp-config <ftpConfig> --working-dir <workingDir> --ref <mirrorBranch> --baseline-ref <deployedTag> --mtime-cutoff <mtimeWatermark> --exclude "<pattern>" ...
 ```
 
 Pass every pattern from the config's `excludePatterns` as a repeated
@@ -275,7 +307,7 @@ deploy range declared:
 
 ```bash
 cd <mirrorWorktree>
-python <this skill>/scripts/scan_remote_vs_local.py --ftp-config <ftpConfig> --working-dir <mirrorWorktree> --ref <mirrorBranch> --baseline-ref <deployedTag> --pull-orphans --pull-modified --deploy-range "<deployedTag>..<deployBranch>" [--exclude ...]
+python <this skill>/scripts/scan_remote_vs_local.py --ftp-config <ftpConfig> --working-dir <mirrorWorktree> --ref <mirrorBranch> --baseline-ref <deployedTag> --mtime-cutoff <mtimeWatermark> --pull-orphans --pull-modified --deploy-range "<deployedTag>..<deployBranch>" [--exclude ...]
 ```
 
 - **Orphans** are downloaded into the worktree (no local copy exists to
@@ -322,6 +354,129 @@ something applies them — don't treat a backup as "handled".
 
 If Stage 1 pulled nothing, there's nothing to commit in Stage 2. If it found
 no modified files either, Stage 4's preflight should come back clean.
+
+**Remote-side manifest scanner (optional, opt-in per project) — for
+projects where Stage 1's FTP walk itself is the bottleneck, not just
+re-fetching unchanged content.** `--mtime-cutoff` above still lists every
+remote directory on every run; it only skips downloading content for files
+that haven't moved. When most of a project's tracked tree is vendored/
+third-party code with no `composer.json`/`package.json` to regenerate it
+from (so it's tracked as real source rather than gitignored — verified on
+mirosv2, where this was ~91% of ~48K tracked files), even the listing cost
+dominates. A small PHP scanner, deployed once to the project's own web root,
+moves that walk off the network entirely — verified end-to-end against a
+real production host (mirosv2): a full 8,111-directory walk done *locally on
+the server* completed in ~4.7 seconds, repeatedly, versus a ~2+ hour
+projected FTP walk for the same tree (measured to 55% completion before
+being superseded by this). That's roughly three orders of magnitude, not a
+marginal win — worth the one-time setup for any project with a similarly
+large static/vendor tree.
+
+*Setup, once per project:*
+1. Copy `assets/sample_remote_scanner.php` to the project and fill in its
+   two `BEFORE DEPLOYING` spots: a fresh secret (`python -c "import secrets;
+   print(secrets.token_hex(32))"` — never reuse one across projects, never
+   commit the filled-in file anywhere) and the project's own
+   `excludePatterns` (kept in sync by hand with the workflow config's copy —
+   see the file's own comments for why this isn't sourced from one place
+   yet).
+2. Deploy it via FTP to the project's web root (same level as its front
+   controller), named however you like (`_crd_stage1_scan.php` in the
+   mirosv2 deployment).
+3. Add `remoteManifestUrl` (the deployed script's full URL) and
+   `remoteManifestSecret` (the same secret from step 1) to the project's
+   `<project>_workflow.json` — see `assets/sample_workflow_config.json`.
+4. Verify the manifest is actually blocked from direct HTTP access before
+   relying on this — fetch `<remoteManifestUrl's dir>/.crd_stage1/manifest.sqlite`
+   directly once the scanner has run once (it creates the `.htaccess` itself
+   on first run) and confirm it 403s. `.htaccess` honoring isn't guaranteed
+   on every host (`AllowOverride` can be restricted) — this is a real check,
+   not a formality.
+
+*Using it, each Stage 1 cycle (when should_run was true):*
+
+```bash
+python <this skill>/scripts/remote_manifest_precheck.py --url <remoteManifestUrl> --secret <remoteManifestSecret> --working-dir <workingDir> --ref <mirrorBranch> --watermark <remoteManifestLastMtime> --json
+```
+
+(Omit `--watermark` on the very first check for a project — the state file's
+`remoteManifestLastMtime` starts null, and the precheck itself treats "no
+watermark" as "prime it, do a full walk this time" rather than erroring.)
+
+Read the result:
+- **`remote_available: false`** — the precheck couldn't reach/trust the
+  scanner (network error, rate-limited, wrong response shape). Fails safe:
+  proceed with Stage 1's normal FTP walk exactly as if this optional step
+  didn't exist. Never treat unavailability as "skip the check" — that would
+  turn a network hiccup into a silent correctness hole.
+- **`skip_walk: true`** — the remote's root mtime hasn't moved since the
+  last known-clean watermark. Nothing under the whole tree has changed;
+  skip Stage 1's FTP walk entirely for this cycle and say so.
+- **`skip_walk: false`** with a non-empty `prune_patterns`/`include_roots` —
+  something changed, but only in the listed subtrees. Pass the extras
+  through to the *same* Stage 1 `scan_remote_vs_local.py` invocation
+  documented above — either every entry in `prune_patterns` as additional
+  `--exclude` flags (on top of the project's persistent `excludePatterns`),
+  **or** every entry in `include_roots` as `--include-root` flags. Both
+  represent the identical scope; they're two different encodings of the same
+  decision, not two different levels of safety — see the note below on
+  which to prefer.
+- **`skip_walk: false` with both lists empty** — no prior watermark yet
+  (first check for this project) or the pruning step itself failed after a
+  trustworthy root-level "something changed" read; do the normal full Stage
+  1 walk, unnarrowed.
+
+*After a `remote_available: true` result whose walk actually ran to
+completion* (i.e. not a rate-limited or otherwise unavailable cycle), record
+its `remote_root_mtime` as the new baseline:
+
+```bash
+python <this skill>/scripts/stage1_gate.py --state-file <stage1StateFile> --set-remote-manifest-mtime <remote_root_mtime>
+```
+
+*`--exclude`/`prune_patterns` vs `--include-root`/`include_roots` — which to
+use:* prefer `--include-root` — same coverage as `--exclude`, far more
+compact input (a real production comparison on mirosv2: 9 touched-set
+entries vs. 114 exclude patterns for the identical change, with **identical
+results**: same orphans/modified/missing/matched_count, `--include-root` a
+little faster in that run though live network timing isn't a reliable
+signal either way). `prune_patterns` stays available mainly for comparison/
+debugging.
+
+Getting `--include-root` to that point of genuine parity took two real bugs,
+worth knowing about since both are easy to reintroduce:
+
+1. **A naive version jumped straight to the touched leaf paths**, never
+   listing `remote_root` or any ancestor on the way down. That missed
+   orphans sitting loose in the root itself (verified live: it silently
+   missed the scanner's own deployment files sitting there). Fixed by still
+   listing every ancestor, exactly like `--exclude` does — only the
+   *descend* decision differs, not what gets listed.
+2. **Reducing the touched set down to just its deepest ("leaf") paths and
+   checking "is this an ancestor-of/descendant-of a leaf" seems equivalent
+   to passing the full set, but isn't.** Once the walk is inside a leaf's
+   own subtree, every path there trivially satisfies "descendant of" — so a
+   touched leaf's own *untouched* children got walked too (verified live: a
+   touched `xs/plugins/noty` caused its stale `lib`/`docs`/`demo`/`test`/
+   `.github`/`src` subdirectories to be fully walked as well, more than
+   doubling the run's file count and wall time versus `--exclude`). The fix
+   was to stop reducing to leaves at all: `--include-root` now expects the
+   **full** touched-path set (still small — proportional to how deep the
+   real changes are, not to how many stale siblings exist), and the descend
+   check is plain set membership, nothing cleverer. `remote_manifest_precheck.py`
+   already does this correctly; if you're ever tempted to "simplify" its
+   `include_roots` down to leaves again, don't — see the comment above
+   `compute_prune_patterns` in that file for the full account.
+
+*What this is not a substitute for:* the remote manifest's "touched since
+watermark" model only ever answers "what changed since the last time we
+looked" — it cannot retroactively surface something that was already
+sitting on the server (an old orphan, stray content) before any watermark
+existed for that project. That's exactly what Stage 1's own full,
+un-narrowed first run (no watermark case above) is for — don't skip it by
+priming a watermark some other way (e.g. calling this precheck once just to
+seed `remoteManifestLastMtime`) without an actual completed full walk
+somewhere in that project's history to back it up.
 
 ### Stage 2 — Commit the pulls onto the mirror branch
 

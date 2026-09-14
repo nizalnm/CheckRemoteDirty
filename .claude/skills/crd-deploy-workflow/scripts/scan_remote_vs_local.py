@@ -67,6 +67,11 @@ Options:
     --exclude PATTERN     glob pattern to skip entirely (repeatable); matched against
                           both the full relative path and the basename
     --pull-orphans        download orphan files into --working-dir (default: report only)
+    --mtime-cutoff VALUE  raw YYYYMMDDHHMMSS (UTC) watermark from stage1_gate.py's
+                          mtimeWatermark; tracked files whose remote mtime predates it
+                          skip the RETR+compare entirely (assumed unchanged since the
+                          last clean run) — see walk_remote()'s docstring for the mtime
+                          source and main()'s watermark comment for the safety argument
     --retries N           reconnect-and-retry attempts per FTP operation before giving
                           up (default: 2)
     --json
@@ -210,6 +215,20 @@ def _parse_list_line(line: str):
     return name, is_dir, int(m.group("size"))
 
 
+def _normalize_mtime(raw: str | None) -> str | None:
+    """Normalize an MLSD "modify" fact to a plain 14-digit YYYYMMDDHHMMSS
+    string (UTC, no separators, fractional seconds dropped) so it can be
+    compared lexicographically — directly against itself, against
+    get_remote_mtime()'s MDTM-derived value once dashes/colons are stripped,
+    and against --mtime-cutoff / the stored watermark, all of which use this
+    same plain format. None in, None out: a missing/malformed fact just means
+    this file never qualifies for the --mtime-cutoff skip in main()."""
+    if not raw:
+        return None
+    digits = raw.split(".", 1)[0]
+    return digits if len(digits) == 14 and digits.isdigit() else None
+
+
 def crd_normalize(data: bytes) -> bytes:
     """CRD's own whitespace-agnostic normalization: strip CR, LF, space, tab
     entirely before hashing/comparing. Kept identical to
@@ -240,9 +259,42 @@ def should_prune_dir(rel: str, patterns: list[str]) -> bool:
     return is_excluded(f"{rel}/__prune_probe__", patterns)
 
 
+def on_path_to_any_leaf(rel: str, touched: set[str]) -> bool:
+    """True if `rel` is worth descending into when walk_remote() is given
+    include_roots — plain membership in `touched`, nothing more clever than
+    that. `touched` here is meant to be the FULL touched-path set from
+    action=dump (every directory whose bubbled_max_mtime exceeds the
+    watermark - by the bubbling invariant that's every ancestor of every
+    real change, all the way up to root, AND every intermediate directory
+    down to the exact changed leaf - not just the deepest touched paths).
+
+    That distinction matters and was the source of a real bug: reducing to
+    "deepest touched leaves only" and checking is-this-an-ancestor-or-
+    descendant-of-a-leaf seems equivalent but isn't - once inside a leaf's
+    own subtree, EVERY path trivially satisfies "descendant of", which
+    silently walks that leaf's own untouched children too (e.g. a touched
+    xs/plugins/noty's own stale lib/docs/demo/test/.github/src
+    subdirectories all got walked, even though action=dump's response
+    already had rows for each of them proving they were NOT touched).
+    Plain set membership against the full touched set doesn't have this
+    problem: xs/plugins/noty/lib simply never being IN that set is enough to
+    prune it, at any depth, with the exact same precision --exclude gets
+    from walking the local git tree — no distinction between "on the way
+    down" and "already arrived" needs to be made at all."""
+    return rel in touched
+
+
 def walk_remote(session: FtpSession, remote_root: str,
-                 exclude: list[str] | None = None) -> tuple[list[tuple[str, int]], dict]:
-    """Return ([(rel_path, size), ...], stats) for every file under remote_root.
+                 exclude: list[str] | None = None,
+                 include_roots: list[str] | None = None) -> tuple[list[tuple[str, int, str | None]], dict]:
+    """Return ([(rel_path, size, mtime), ...], stats) for every file under remote_root.
+
+    `mtime` is the MLSD "modify" fact (raw YYYYMMDDHHMMSS, UTC, no separators)
+    when the listing came from MLSD — the common case — or None when it came
+    from the LIST/NLST fallback paths, which don't carry a reliable mtime
+    without an extra per-file MDTM round trip this walk doesn't spend. A file
+    with mtime None just never qualifies for the --mtime-cutoff skip in
+    main() and gets fully checked, same as before this field existed.
 
     Iterative (stack-based), not recursive: if a directory listing needs a
     reconnect partway through, the walk resumes from wherever the stack left
@@ -255,11 +307,32 @@ def walk_remote(session: FtpSession, remote_root: str,
     that subtree can be the majority of the whole remote file count, and
     every directory inside it is one more round trip (and one more chance to
     need a reconnect) for content nobody expects to find hand-edited on a
-    live server anyway."""
-    files: list[tuple[str, int]] = []
+    live server anyway.
+
+    `include_roots`, when given, still starts the walk at remote_root and
+    still lists every ancestor directory along the way — that matters, it's
+    what catches an orphan/stray file sitting loose in remote_root itself or
+    in any other ancestor, the one thing a naive "jump straight to the known
+    paths" version would miss. What changes is the descend decision: a
+    child directory is only pushed onto the stack if it's itself a member of
+    include_roots (see on_path_to_any_leaf() - plain set membership, not a
+    prefix/ancestor check). This MUST be the full touched-path set from
+    action=dump (every ancestor down to each real change, not just the
+    deepest "leaf" paths) — reducing to leaves and substituting an ancestor-
+    or-descendant-of check was tried and is wrong: it can't tell a touched
+    leaf's own untouched children apart from a real change, since every
+    path below a leaf trivially "descends from" it. Passing the full set
+    costs nothing extra (it's still small - proportional to how deep the
+    actual changes are, not to how many stale siblings exist) and gets the
+    exact same per-level precision --exclude has. Every other sibling is
+    skipped exactly like an `exclude`-matched one is, just without needing
+    to name it. `exclude` still applies on top when both are given, e.g. for
+    permanent never-relevant paths."""
+    files: list[tuple[str, int, str | None]] = []
     stats = {"mlsd_dirs": 0, "list_dirs": 0, "nlst_dirs": 0, "pruned_dirs": 0}
     pruned_paths: list[str] = []
     patterns = exclude or []
+    leaves = set(include_roots) if include_roots else set()
     root = remote_root.rstrip("/") or "/"
     stack: list[tuple[str, str]] = [(root, "")]
     dirs_visited = 0
@@ -268,6 +341,11 @@ def walk_remote(session: FtpSession, remote_root: str,
 
     def maybe_descend(full: str, rel: str) -> None:
         if patterns and should_prune_dir(rel, patterns):
+            stats["pruned_dirs"] += 1
+            if len(pruned_paths) < 20:
+                pruned_paths.append(rel)
+            return
+        if leaves and not on_path_to_any_leaf(rel, leaves):
             stats["pruned_dirs"] += 1
             if len(pruned_paths) < 20:
                 pruned_paths.append(rel)
@@ -307,7 +385,7 @@ def walk_remote(session: FtpSession, remote_root: str,
                 if kind == "dir":
                     maybe_descend(full, rel)
                 elif kind == "file":
-                    files.append((rel, int(facts.get("size", 0) or 0)))
+                    files.append((rel, int(facts.get("size", 0) or 0), _normalize_mtime(facts.get("modify"))))
             continue
 
         try:
@@ -323,7 +401,7 @@ def walk_remote(session: FtpSession, remote_root: str,
                 if is_dir:
                     maybe_descend(full, rel)
                 else:
-                    files.append((rel, size))
+                    files.append((rel, size, None))
             continue
 
         # Last-resort fallback: NLST + a cwd probe per entry to tell files from
@@ -343,6 +421,11 @@ def walk_remote(session: FtpSession, remote_root: str,
                 if len(pruned_paths) < 20:
                     pruned_paths.append(rel)
                 continue
+            if leaves and not on_path_to_any_leaf(rel, leaves):
+                stats["pruned_dirs"] += 1
+                if len(pruned_paths) < 20:
+                    pruned_paths.append(rel)
+                continue
             try:
                 session.cwd(full)
                 session.cwd("..")
@@ -352,7 +435,7 @@ def walk_remote(session: FtpSession, remote_root: str,
                     size = session.size(full) or 0
                 except Exception:
                     size = 0
-                files.append((rel, size))
+                files.append((rel, size, None))
 
     stats["pruned_dir_samples"] = pruned_paths
     return files, stats
@@ -505,6 +588,15 @@ def main(argv=None):
     p.add_argument("--repo-name", default=None)
     p.add_argument("--baseline-ref", default=None)
     p.add_argument("--exclude", action="append", default=[])
+    p.add_argument("--include-root", action="append", default=[],
+                   help="restrict descent to these git-relative paths only (repeatable) - MUST "
+                        "be the FULL touched-path set (every ancestor down to each real change, "
+                        "e.g. remote_manifest_precheck.py's action=dump 'touched' paths), not "
+                        "just the deepest ones - see walk_remote()'s docstring for why leaves-only "
+                        "is wrong. remote_root and every ancestor on the way down are still "
+                        "listed (so loose files/orphans at any level are still found); a "
+                        "directory is only descended into if it's itself in this set. Compact "
+                        "alternative to enumerating --exclude patterns for the same effect")
     p.add_argument("--pull-orphans", action="store_true")
     p.add_argument("--pull-modified", action="store_true",
                    help="mirror-worktree mode: overwrite the working copy of modified tracked "
@@ -519,9 +611,19 @@ def main(argv=None):
     p.add_argument("--timeout", type=float, default=30.0,
                    help="per-socket-operation timeout in seconds before a stalled read/write "
                         "counts as retryable (default: 30)")
+    p.add_argument("--mtime-cutoff", default=None,
+                   help="raw YYYYMMDDHHMMSS (UTC) watermark from a prior clean run (see "
+                        "stage1_gate.py's mtimeWatermark). A tracked file whose MLSD 'modify' "
+                        "fact is present and older than this is assumed unchanged since it was "
+                        "last verified and skipped entirely - no RETR, no compare, counted "
+                        "straight into matched_count. Files with no mtime fact (LIST/NLST "
+                        "fallback, or the fact simply wasn't returned) are always fully checked, "
+                        "same as before this flag existed - it only ever narrows the set of "
+                        "content actually fetched, never the set of files listed.")
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
 
+    scan_started_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
     config = load_ftp_config(args.ftp_config)
     remote_root = config.get("remote_root", "/")
     working_dir = os.path.abspath(args.working_dir)
@@ -546,13 +648,15 @@ def main(argv=None):
 
     session = FtpSession(config, retries=args.retries, timeout=args.timeout)
     try:
-        remote_files, walk_stats = walk_remote(session, remote_root, exclude=args.exclude)
+        remote_files, walk_stats = walk_remote(session, remote_root, exclude=args.exclude,
+                                                include_roots=args.include_root)
         print(f"walk complete: {len(remote_files)} remote file(s), "
               f"{session.reconnects} reconnect(s)", file=sys.stderr, flush=True)
-        remote_files = [(rel, size) for rel, size in remote_files if not is_excluded(rel, args.exclude)]
+        remote_files = [(rel, size, mtime) for rel, size, mtime in remote_files
+                        if not is_excluded(rel, args.exclude)]
         tracked = git_tracked_set(working_dir, args.ref)
 
-        untracked = [rel for rel, _size in remote_files if rel not in tracked]
+        untracked = [rel for rel, _size, _mtime in remote_files if rel not in tracked]
         ignored = git_ignored_set(working_dir, untracked)
         orphans = [rel for rel in untracked if rel not in ignored]
 
@@ -571,13 +675,22 @@ def main(argv=None):
         pulled_modified = []
         missing_locally = []
         matched = 0
-        tracked_remote = [(rel, size) for rel, size in remote_files if rel in tracked]
-        for i, (rel, _size) in enumerate(tracked_remote, 1):
+        skipped_via_mtime = 0
+        tracked_remote = [(rel, size, mtime) for rel, size, mtime in remote_files if rel in tracked]
+        for i, (rel, _size, mtime) in enumerate(tracked_remote, 1):
             if i == 1 or i % 20 == 0 or i == len(tracked_remote):
                 print(f"comparing tracked file {i}/{len(tracked_remote)}", file=sys.stderr, flush=True)
             local_path = Path(working_dir) / rel
             if not local_path.is_file():
                 missing_locally.append(rel)
+                continue
+
+            if args.mtime_cutoff and mtime and mtime < args.mtime_cutoff:
+                # Unchanged on the remote since the last time a clean run
+                # verified it (see stage1_gate.py's mtimeWatermark) - assume
+                # it still matches without spending a RETR to re-prove it.
+                matched += 1
+                skipped_via_mtime += 1
                 continue
 
             remote_path = f"{remote_root.rstrip('/')}/{rel}"
@@ -615,6 +728,17 @@ def main(argv=None):
     finally:
         session.quit()
 
+    # Safe to advance the watermark only when this run leaves nothing
+    # unresolved: any still-divergent file (a conflict backup was written,
+    # or a tracked path was missing locally) means the tree isn't fully
+    # accounted for, so next run must still check it rather than trust a new
+    # cutoff that would skip right past it. scan_started_at (captured before
+    # the walk) is used rather than "now" so a file touched partway through
+    # this run - which may or may not have been caught depending on when the
+    # walk reached it - is never treated as covered by this run's watermark.
+    safe_to_advance_watermark = not modified and not missing_locally
+    suggested_new_watermark = scan_started_at if safe_to_advance_watermark else None
+
     result = {
         "remote_root": remote_root,
         "ref": args.ref,
@@ -622,6 +746,10 @@ def main(argv=None):
         "remote_file_count": len(remote_files),
         "tracked_count": len(tracked),
         "matched_count": matched,
+        "skipped_via_mtime_count": skipped_via_mtime,
+        "mtime_cutoff_used": args.mtime_cutoff,
+        "scan_started_at": scan_started_at,
+        "suggested_new_watermark": suggested_new_watermark,
         "orphans": orphans,
         "pulled": pulled,
         "pulled_modified": pulled_modified,
@@ -648,6 +776,9 @@ def main(argv=None):
                   "narrowing --exclude if this host is unreliable for full-tree scans")
         if session.reconnects:
             print(f"  note: reconnected {session.reconnects} time(s) after the server reset the connection")
+        if args.mtime_cutoff:
+            print(f"  {skipped_via_mtime} of those matches skipped the RETR+compare entirely "
+                  f"(remote mtime older than --mtime-cutoff {args.mtime_cutoff})")
         print(f"  {matched} match local (identical, or differ only by whitespace/line endings)")
         print(f"  {len(orphans)} orphan(s) — on remote, not tracked, not gitignored")
         for rel in orphans:
@@ -674,6 +805,12 @@ def main(argv=None):
                   f"but missing from the local working dir — check these by hand:")
             for rel in missing_locally:
                 print(f"    {rel}")
+        if suggested_new_watermark:
+            print(f"  clean run — safe to advance the watermark to {suggested_new_watermark} "
+                  f"(stage1_gate.py --record-run --outcome clean --new-watermark {suggested_new_watermark})")
+        else:
+            print("  not advancing the watermark — unresolved modified/missing-locally file(s) "
+                  "above still need checking next run too")
     return 0
 
 
