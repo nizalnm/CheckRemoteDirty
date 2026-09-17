@@ -372,26 +372,44 @@ being superseded by this). That's roughly three orders of magnitude, not a
 marginal win — worth the one-time setup for any project with a similarly
 large static/vendor tree.
 
-*Setup, once per project:*
-1. Copy `assets/sample_remote_scanner.php` to the project and fill in its
-   two `BEFORE DEPLOYING` spots: a fresh secret (`python -c "import secrets;
-   print(secrets.token_hex(32))"` — never reuse one across projects, never
-   commit the filled-in file anywhere) and the project's own
-   `excludePatterns` (kept in sync by hand with the workflow config's copy —
-   see the file's own comments for why this isn't sourced from one place
-   yet).
-2. Deploy it via FTP to the project's web root (same level as its front
-   controller), named however you like (`_crd_stage1_scan.php` in the
-   mirosv2 deployment).
-3. Add `remoteManifestUrl` (the deployed script's full URL) and
-   `remoteManifestSecret` (the same secret from step 1) to the project's
-   `<project>_workflow.json` — see `assets/sample_workflow_config.json`.
-4. Verify the manifest is actually blocked from direct HTTP access before
-   relying on this — fetch `<remoteManifestUrl's dir>/.crd_stage1/manifest.sqlite`
-   directly once the scanner has run once (it creates the `.htaccess` itself
-   on first run) and confirm it 403s. `.htaccess` honoring isn't guaranteed
-   on every host (`AllowOverride` can be restricted) — this is a real check,
-   not a formality.
+*Setup, once per project — `install_remote_scanner.py` does steps 1–3 in one
+shot, and is safe to run repeatedly (idempotent: a no-op if the file is
+already there):*
+
+```bash
+python <this skill>/scripts/install_remote_scanner.py --ftp-config <ftpConfig> --remote-path _crd_stage1_scan.php --url https://<project host>/_crd_stage1_scan.php --workflow-config <the project's own workflow.json path> --exclude-patterns-json '<the project workflow.json excludePatterns, as a JSON array string>' --json
+```
+
+This checks the target path **over FTP** (never HTTP — see the script's own
+docstring for why: the deployed scanner deliberately returns the same
+generic 404 for a wrong token as for genuinely not-installed, so an HTTP
+404 can't safely be read as "go ahead and install" without risking a
+clobber over a real deployment on a simple auth mismatch). Only installs
+when FTP confirms the file is truly missing; pass `--force` to deliberately
+reinstall/rotate the secret. Generates a fresh secret, fills in the
+template (both the secret and, via `--exclude-patterns-json`, the
+project's own excludePatterns — no more hand-syncing two copies of that
+list), uploads it, and writes `remoteManifestUrl`/`remoteManifestSecret`
+straight into `--workflow-config` — the secret is written to that file,
+never printed to this script's own output when `--workflow-config` is
+given (omit it only if nothing has file access to save it, in which case
+it comes back in the JSON result instead, the only way to hand it over at
+all in that case).
+
+**Run this same command as an automatic reconciliation step at the start of
+every Stage 1 cycle** for any project that has `remoteManifestUrl`
+configured — cheap (one FTP SIZE/MLSD check when already installed, which
+is the common case) and self-healing if the file is ever deleted from the
+server, a fresh clone of the workflow config lands on a project that never
+had it deployed, or similar drift.
+
+After installing (by either path), verify the manifest is actually blocked
+from direct HTTP access before relying on this — fetch
+`<remoteManifestUrl's dir>/.crd_stage1/manifest.sqlite` directly once the
+scanner has run once (it creates the `.htaccess` itself on first run) and
+confirm it 403s. `.htaccess` honoring isn't guaranteed on every host
+(`AllowOverride` can be restricted) — this is a real check, not a
+formality.
 
 *Using it, each Stage 1 cycle (when should_run was true):*
 
