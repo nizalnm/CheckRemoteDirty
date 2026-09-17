@@ -896,6 +896,7 @@ summary:
 | "merge in the server's conflicts for X" | Stage 5 only (assumes Stage 4 already ran / conflicts already exist) |
 | "move the deployed tag for X" | Stage 7 only |
 | "sync staging up to what's deployed" | Stage 8 only |
+| "check/install the remote scanner for X" / "make sure the remote manifest scanner is deployed" | `install_remote_scanner.py` only (idempotent — reports already-installed and stops if it's already there) |
 
 If a user asks for the full deploy but a config file doesn't exist yet, walk
 them through creating one (see Setup) before Stage 1 — don't guess at FTP
