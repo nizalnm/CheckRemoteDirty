@@ -115,6 +115,26 @@ DEFAULT_STATE = {
 }
 
 
+def resolve_state_path(path: str, crd_root: str) -> str:
+    """Resolve --state-file against --crd-root.
+
+    This sidecar is documented to live next to a project's other CRD files
+    under CRD_ROOT, but this gate is routinely invoked "from any checkout"
+    (a mirror worktree, a project dir) with a bare relative filename like
+    the SKILL.md examples show — so a naive relative open() silently landed
+    on the wrong (non-existent) path and load_state()'s "missing file ==
+    fresh state" fallback masked it as a quiet reset to defaults instead of
+    an error. An absolute path, or an already-existing cwd-relative file
+    (e.g. when cwd already is CRD_ROOT), is honored as given; otherwise a
+    bare filename resolves under crd_root — including the genuinely-first-run
+    case, so a brand new state file is created in the right place rather
+    than wherever the command happened to be run from.
+    """
+    if os.path.isabs(path) or os.path.exists(path):
+        return path
+    return os.path.join(crd_root, path)
+
+
 def load_state(path):
     if not os.path.exists(path):
         return dict(DEFAULT_STATE)
@@ -204,6 +224,9 @@ def do_record_external_drift(state):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--state-file", required=True)
+    p.add_argument("--crd-root", default=os.environ.get("CRD_ROOT", r"C:\www\CheckRemoteDirty"),
+                   help="CRD install dir, used to resolve a bare --state-file filename "
+                        "(default: $CRD_ROOT or C:\\www\\CheckRemoteDirty)")
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--record-run", action="store_true")
@@ -227,20 +250,21 @@ def main(argv=None):
     if args.set_remote_manifest_mtime is not None and not args.set_remote_manifest_mtime.lstrip("-").isdigit():
         p.error("--set-remote-manifest-mtime must be an integer unix timestamp")
 
-    state = load_state(args.state_file)
+    state_file = resolve_state_path(args.state_file, args.crd_root)
+    state = load_state(state_file)
 
     if args.check:
         result = do_check(state)
     elif args.record_run:
         result = do_record_run(state, args.outcome, new_watermark=args.new_watermark)
-        save_state(args.state_file, state)
+        save_state(state_file, state)
     elif args.record_external_drift:
         result = do_record_external_drift(state)
-        save_state(args.state_file, state)
+        save_state(state_file, state)
     else:
         state["remoteManifestLastMtime"] = args.set_remote_manifest_mtime
         result = {"detail": f"remoteManifestLastMtime set to {args.set_remote_manifest_mtime}"}
-        save_state(args.state_file, state)
+        save_state(state_file, state)
 
     result["state"] = state
     if args.json:

@@ -723,6 +723,37 @@ Stage 4's report was stale (something changed between it and the deploy) —
 don't retry with more piped input, re-run Stage 4 fresh and re-confirm with
 the user instead.
 
+**Flaky FTP link: use `scripts/crd_deploy_loop.py` instead of hand-repeating Stage 4/6.** On some hosts the FTP server
+drops the connection after a handful of files (`SSL: BAD_LENGTH`, `WinError 10054/10013`) and then refuses new logins for
+a while, so one `--deployOnClean` run only uploads part of a large deploy. Every re-run uploads only what is not yet at the
+goal version, so the loop converges; the script automates it and adds the safeguards a hand-run loop lacks. It reads the
+project's `<project>_workflow.json`:
+
+```bash
+python <this skill>/scripts/crd_deploy_loop.py --project <project> --goal <commit-ish> --status   # preflight only
+python <this skill>/scripts/crd_deploy_loop.py --project <project> --goal <commit-ish> --move-tag --cleanup
+```
+
+What it guarantees: (1) the goal is resolved ONCE to a full commit hash and pinned (a branch another session moves mid-run
+cannot change what goes up; this happens when a teammate's session merges into the deploy branch during a long upload); (2) files are uploaded from a
+dedicated clean detached worktree `<workingDir>-deploy-<short>` of exactly that commit, so uncommitted or later work in the
+main checkout can never leak to the server; (3) a server file that differs from BOTH the old and the new version is never
+overwritten unless it is provably a truncated upload (empty or a strict prefix of the new file) left by a dropped connection
+(one such pass left a zero-byte file); (4) tests (`loopExcludePatterns`, default `dev/tests/*`, `tests/*`) and the project's
+`excludePatterns` are not uploaded; (5) it stops after N passes with no progress; (6) `--move-tag` moves the LOCAL deployed
+tag only forward (never pushed) and fast-forwards the mirror worktree. Only run ONE loop at a time (two fight over the same
+FTP server). Never start it with a goal that is not the exact commit you showed the user in the Stage 6 confirmation. After a
+hand-run pass that dropped, ALWAYS finish with a full preflight showing every file `MATCH GOAL` before moving the tag
+(Stage 7); for the file every page loads (e.g. `system/bootstrap.php`) also check it is byte-identical to the goal, because a
+dropped upload can leave it empty. It does not run database migrations.
+
+Wait between passes is ADAPTIVE: start aggressive (base 1 second) and back off only while passes upload nothing: after a pass
+that uploads no file the wait doubles (2, 4, 8 ... up to the ceiling, default 60 seconds) and snaps back to the base as soon as
+a pass gets a file through (early passes with a 3 second pause moved 20-59 files each; a fixed long wait was not what made
+things work, the server only started refusing after sustained hammering). Base: `--delay N`, else env `CRD_LOOP_DELAY`, else
+`"loopDelaySeconds"` in the workflow config, else 1. Ceiling: `--max-delay N`, else env `CRD_LOOP_MAX_DELAY`, else
+`"loopMaxDelaySeconds"`, else 60. A base of 0 means no wait while things progress (back-off still applies when they stop).
+
 **CRD now supports deletions, but only as an explicit opt-in, separate from
 the normal upload flow above** (`CheckRemoteDirty.py`'s deletion-support
 design, `docs/deletion-support-proposal.md` in the CRD repo — added

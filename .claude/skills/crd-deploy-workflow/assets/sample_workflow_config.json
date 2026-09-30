@@ -10,5 +10,8 @@
   "gitRemote": "origin",
   "excludePatterns": ["cache/*", "*.log", "Thumbs.db"],
   "remoteManifestUrl": "https://myproject.example.com/_crd_stage1_scan.php",
-  "remoteManifestSecret": "REPLACE_WITH_THE_SAME_FRESH_SECRET_BAKED_INTO_THE_DEPLOYED_SCANNER"
+  "remoteManifestSecret": "REPLACE_WITH_THE_SAME_FRESH_SECRET_BAKED_INTO_THE_DEPLOYED_SCANNER",
+  "loopExcludePatterns": ["dev/tests/*", "tests/*"],
+  "loopDelaySeconds": 1,
+  "loopMaxDelaySeconds": 60
 }

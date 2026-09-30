@@ -65,12 +65,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import secrets
 import sys
 from ftplib import FTP_TLS, error_perm
 
 TEMPLATE_DEFAULT = None  # resolved relative to this script's own location
+
+
+def resolve_crd_path(path: str, crd_root: str) -> str:
+    """Resolve a bare CRD asset filename (--ftp-config/--workflow-config)
+    against --crd-root when it isn't found as given. Both files
+    conventionally live under CRD_ROOT (see SKILL.md's Setup section), but
+    this script may be run from any cwd, so a relative filename that
+    doesn't exist relative to cwd is retried relative to crd_root before
+    giving up. Absolute paths and paths that already resolve as given are
+    returned unchanged.
+    """
+    if os.path.isabs(path) or os.path.exists(path):
+        return path
+    candidate = os.path.join(crd_root, path)
+    if os.path.exists(candidate):
+        return candidate
+    return path  # nothing matched either way — let the caller's own open() report it
 
 
 def load_json(path: str) -> dict:
@@ -131,6 +149,9 @@ def fill_template(template_text: str, secret: str, exclude_patterns: list[str] |
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ftp-config", required=True)
+    p.add_argument("--crd-root", default=os.environ.get("CRD_ROOT", r"C:\www\CheckRemoteDirty"),
+                   help="CRD install dir, used to resolve bare --ftp-config/--workflow-config "
+                        "filenames (default: $CRD_ROOT or C:\\www\\CheckRemoteDirty)")
     p.add_argument("--remote-path", default="_crd_stage1_scan.php",
                    help="path relative to the FTP config's remote_root (default: _crd_stage1_scan.php)")
     p.add_argument("--template", default=None,
@@ -152,11 +173,15 @@ def main(argv=None) -> int:
 
     template_path = args.template
     if template_path is None:
-        import os
         template_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                       "assets", "sample_remote_scanner.php")
 
-    ftp_config = load_json(args.ftp_config)
+    ftp_config_path = resolve_crd_path(args.ftp_config, args.crd_root)
+    workflow_config_path = (
+        resolve_crd_path(args.workflow_config, args.crd_root) if args.workflow_config else None
+    )
+
+    ftp_config = load_json(ftp_config_path)
     remote_root = ftp_config.get("remote_root", "/")
 
     ftp = connect_ftp(ftp_config)
@@ -175,7 +200,7 @@ def main(argv=None) -> int:
             existing_secret = None
             if args.workflow_config:
                 try:
-                    existing_secret = load_json(args.workflow_config).get("remoteManifestSecret")
+                    existing_secret = load_json(workflow_config_path).get("remoteManifestSecret")
                 except FileNotFoundError:
                     pass
             secret = existing_secret if (existing_secret and not args.force) else secrets.token_hex(32)
@@ -193,13 +218,13 @@ def main(argv=None) -> int:
             workflow_updated = False
             if args.workflow_config:
                 try:
-                    wf = load_json(args.workflow_config)
+                    wf = load_json(workflow_config_path)
                 except FileNotFoundError:
                     wf = {}
                 wf["remoteManifestSecret"] = secret
                 if args.url:
                     wf["remoteManifestUrl"] = args.url
-                with open(args.workflow_config, "w", encoding="utf-8") as f:
+                with open(workflow_config_path, "w", encoding="utf-8") as f:
                     json.dump(wf, f, indent=4)
                     f.write("\n")
                 workflow_updated = True

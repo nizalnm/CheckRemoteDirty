@@ -102,6 +102,23 @@ _LIST_RE = re.compile(
 )
 
 
+def resolve_crd_path(path: str, crd_root) -> str:
+    """Resolve a bare CRD asset filename (--ftp-config etc.) against
+    --crd-root when it isn't found as given. These files conventionally
+    live under CRD_ROOT, but this script is routinely invoked from a
+    different cwd (a mirror worktree, a project dir per the Stage 1 docs),
+    so a relative filename that doesn't exist relative to cwd is retried
+    relative to crd_root before giving up. Absolute paths and paths that
+    already resolve as given are returned unchanged.
+    """
+    if os.path.isabs(path) or os.path.exists(path):
+        return path
+    candidate = os.path.join(str(crd_root), path)
+    if os.path.exists(candidate):
+        return candidate
+    return path  # nothing matched either way — let the caller's own open() report it
+
+
 def load_ftp_config(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -624,10 +641,10 @@ def main(argv=None):
     args = p.parse_args(argv)
 
     scan_started_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
-    config = load_ftp_config(args.ftp_config)
+    crd_root = Path(args.crd_root)
+    config = load_ftp_config(resolve_crd_path(args.ftp_config, crd_root))
     remote_root = config.get("remote_root", "/")
     working_dir = os.path.abspath(args.working_dir)
-    crd_root = Path(args.crd_root)
     repo_name = args.repo_name or Path(working_dir).name
 
     if args.pull_orphans or args.pull_modified:

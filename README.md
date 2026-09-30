@@ -170,6 +170,7 @@ Create a JSON file with your FTP credentials. You can use `sample_ftp_config.jso
 | `FTP Error: 550 No such file` | The remote path provided doesn't exist. | Check `remote_root` in your config. |
 | `Git not found` | The `git` command isn't in your system PATH. | Install Git or add it to PATH. |
 | `UnboundLocalError` | A technical bug in the script. | Report the issue or check if variable initialization is missing. |
+| `SSL: BAD_LENGTH` / `WinError 10054` mid-upload | The FTP server dropped the connection; a large deploy stops part-way. | Re-run, or use `crd_deploy_loop.py` (below) to repeat until every file matches. |
 
 ### FAQ
 **Q: Does this script change my local files?**
@@ -270,6 +271,30 @@ python CheckRemoteDirty.py --workingDir <dir> --ftpConfig <cfg> --restoreFromTra
 python CheckRemoteDirty.py --workingDir <dir> --ftpConfig <cfg> --purgeTrash --olderThanDays 30
 python CheckRemoteDirty.py --workingDir <dir> --ftpConfig <cfg> --purgeTrash --olderThanDays 30 --yes
 ```
+
+---
+
+## Deploying a big change over a flaky FTP link: `crd_deploy_loop.py`
+
+Some hosts drop the FTP connection after a handful of files (`SSL: BAD_LENGTH`, `WinError 10054`) and then refuse new logins for a while, so one `--deployOnClean` run uploads only part of a large deploy. Every re-run uploads only what is not yet at the target version, so repeating converges. `.claude/skills/crd-deploy-workflow/scripts/crd_deploy_loop.py` automates that loop for any project that has a `<project>_workflow.json` (see `assets/sample_workflow_config.json`):
+
+```bash
+# preflight only, uploads nothing
+python .claude/skills/crd-deploy-workflow/scripts/crd_deploy_loop.py --project myproject --goal <commit-ish> --status
+# deploy, then record the result (local tag moved forward, mirror fast-forwarded) and remove the temporary checkout
+python .claude/skills/crd-deploy-workflow/scripts/crd_deploy_loop.py --project myproject --goal <commit-ish> --move-tag --cleanup
+```
+
+What it adds over repeating the command by hand:
+
+* **Pinned goal.** `--goal` is resolved once to a full commit hash, so a branch that moves mid-run (someone merging) cannot change what is uploaded.
+* **Dedicated clean checkout.** Files are uploaded from a detached worktree of exactly that commit, never from a working directory that may hold other work.
+* **No blind overwrites.** A server file that differs from both the old and the new version stops the run, unless it is provably a truncated upload (empty, or a strict prefix of the new file) left by a dropped connection.
+* **Adaptive wait.** The wait between passes starts at 1 second and doubles (up to a ceiling, default 60 seconds) only while passes upload nothing, resetting as soon as a pass makes progress. Base: `--delay N`, else env `CRD_LOOP_DELAY`, else `loopDelaySeconds` in the workflow config. Ceiling: `--max-delay N`, else env `CRD_LOOP_MAX_DELAY`, else `loopMaxDelaySeconds`.
+* **Non-runtime files skipped.** `loopExcludePatterns` in the workflow config (default `dev/tests/*`, `tests/*`) plus the project's `excludePatterns`.
+* **Stops when stuck.** It gives up after several passes without progress (`--stall`, default 8); wait and re-run.
+
+It never runs database migrations and never pushes anything.
 
 ---
 
