@@ -38,6 +38,20 @@ USAGE
 Options: --delay N (base seconds between passes, default 1)  --max-delay N (back-off ceiling, default 60)  --max-passes N  --exclude PATTERN (repeatable)
          --stall N (give up after N passes without progress, default 8)  --allow-non-descendant
 
+CHUNKS (the fix for "passes that upload nothing"): CRD compares EVERY file of the range inside one FTP process BEFORE it uploads the first byte, and
+one CRD process dies around its 155th transfer (WinError 10013, exit code still 0) - a whole-range pass can therefore never reach the upload stage on
+a range of 171 files. So the loop never does a whole-range FTP pass: it takes the file list from CRD's own 'Local Dirty Files' announcement (read, then
+the process is killed before it transfers more than a row), and works through it in CHUNKS of --chunk N files (default 20; 0 = old whole-range passes):
+each pass is a read-only preflight of just that chunk (DIFF vetting) and a deploy run of just that chunk (every other path of the range is excluded by
+exact name), so a process lasts about a minute and a drop costs one chunk. A file counts as settled only when a fresh comparison in THIS run saw it at
+the goal; the files uploaded in this run are compared again once nothing is pending, and only then does the deploy count as finished.
+
+SKIP-CONFIRMED (fewer reads; used when --chunk 0): CRD downloads and hashes EVERY file of the range on every comparison, and a loop pass compares twice (the preflight and
+the deploy run's own table). So once a file is confirmed at the goal (MATCH GOAL in a preflight, or uploaded and verified by CRD in this run) it is
+excluded - by exact path - from later passes of THIS run (the goal is pinned, so nothing can legitimately change it). When nothing is left to upload the
+loop runs ONE full, unskipped verification pass over the whole range; only that pass can finish the deploy. If it finds a file no longer at the goal
+(something rewrote it meanwhile) the loop carries on with that file. --no-skip-confirmed turns the skipping off (every pass compares everything).
+
 HEARTBEAT (so a long pass never looks stuck): CRD's output is streamed live (the child runs unbuffered) and a heartbeat line is printed
 every --heartbeat seconds (default 15; env CRD_LOOP_HEARTBEAT; 0 = off), e.g.
   [hb 12:03:41] pass 2/80 DEPLOY | 37/123 uploaded (30%), 4.1 files/min, ETA ~21m | now: public/x.php (14s) | last ok: y.php 9s ago | drops 1 | alive
@@ -100,6 +114,8 @@ class Progress:
         self.pass_started = time.time()
         self.rows_seen = 0               # preflight table rows read so far in this pass
         self.todo_total = None           # files to upload, from the FIRST preflight
+        self.files_total = None          # files of the range announced by CRD (chunked mode)
+        self.settled = 0                 # files of the range no longer pending (chunked mode)
         self.uploaded_total = 0          # files confirmed uploaded over the whole run
         self.attempted_pass = 0
         self.in_flight = None            # (path, since)
@@ -132,7 +148,10 @@ class Progress:
                     self.first_ok_ts = self.first_ok_ts or now
                     self.in_flight = None
                     total = self.todo_total
-                print('   ok [%d/%s] %s (%s)' % (self.uploaded_total, total if total else '?', path, fmt_dur(took)), flush=True)
+                if total:
+                    print('   ok [%d/%s] %s (%s)' % (self.uploaded_total, total, path, fmt_dur(took)), flush=True)
+                else:
+                    print('   ok [%d uploaded, %d/%s settled] %s (%s)' % (self.uploaded_total, self.settled, self.files_total or '?', path, fmt_dur(took)), flush=True)
             else:
                 with self.lock:
                     self.attempted_pass += 1
@@ -168,7 +187,7 @@ class Progress:
             return {
                 'project': self.project, 'goal': self.goal, 'state': self.state, 'phase': self.phase, 'pid': self.pid,
                 'pass': self.pass_no, 'max_passes': self.max_passes, 'elapsed_s': int(elapsed), 'pass_elapsed_s': int(now - self.pass_started),
-                'todo_total': self.todo_total, 'uploaded_total': self.uploaded_total, 'attempted_this_pass': self.attempted_pass,
+                'todo_total': self.todo_total, 'files_total': self.files_total, 'settled': self.settled, 'uploaded_total': self.uploaded_total, 'attempted_this_pass': self.attempted_pass,
                 'preflight_rows_read': self.rows_seen, 'files_per_min': round(rate, 1) if rate else None, 'eta_s': int(eta) if eta else None,
                 'in_flight': {'path': self.in_flight[0], 'for_s': int(now - self.in_flight[1])} if self.in_flight else None,
                 'last_ok': {'path': self.last_ok[0], 'ago_s': int(now - self.last_ok[1])} if self.last_ok else None,
@@ -196,6 +215,8 @@ class Progress:
 
     @staticmethod
     def _uploaded_text(d):
+        if d.get('files_total'):
+            return '%d/%d settled (%d uploaded)' % (d['settled'], d['files_total'], d['uploaded_total'])
         if d['todo_total']:
             return '%d/%d uploaded (%d%%)' % (d['uploaded_total'], d['todo_total'], 100 * d['uploaded_total'] // max(1, d['todo_total']))
         return '%d uploaded' % d['uploaded_total']
@@ -386,20 +407,80 @@ def build_command(ctx):
     return cmd
 
 
-def classify(output):
+def classify_full(output):
+    """(counts, paths with a DIFF, paths MATCH GOAL) from a CRD table."""
     rows = [l for l in output.splitlines() if '|' in l and ('MATCH' in l or 'DIFF' in l or 'MISSING' in l)]
-    counts, diff = collections.Counter(), []
+    counts, diff, at_goal = collections.Counter(), [], []
     for line in rows:
         if 'DIFF' in line:
             counts['DIFF'] += 1
             diff.append(line.split('|')[0].strip())
         elif 'MATCH GOAL' in line:
             counts['at goal'] += 1
+            at_goal.append(line.split('|')[0].strip())
         elif 'MATCH BASELINE' in line:
             counts['old (to upload)'] += 1
         else:
             counts['new (to upload)'] += 1
+    return counts, diff, at_goal
+
+
+def classify(output):
+    counts, diff, _ = classify_full(output)
     return counts, diff
+
+
+def classify_rows(output):
+    """Ordered [(path, kind)] with kind in goal | diff | old | new, from a CRD table."""
+    out = []
+    for line in output.splitlines():
+        if '|' in line and ('MATCH' in line or 'DIFF' in line or 'MISSING' in line):
+            path = line.split('|')[0].strip()
+            kind = 'diff' if 'DIFF' in line else ('goal' if 'MATCH GOAL' in line else ('old' if 'MATCH BASELINE' in line else 'new'))
+            out.append((path, kind))
+    return out
+
+
+def expected_rows(output):
+    """How many files CRD announced in its 'Local Dirty Files' list: the comparison table must have exactly that many rows to be complete."""
+    return len([l for l in output.splitlines() if re.search(r'\| Git: .* \| Local: ', l)])
+
+
+def table_complete(res, rows):
+    """A preflight is usable when its table has a row for every announced file (a non-zero exit code or a late FTP error does not matter then).
+    Without an announced count, fall back to 'has rows and no link-error text'."""
+    exp = expected_rows(res.stdout or '')
+    if exp:
+        return len(rows) >= exp
+    return bool(rows) and not link_error(res, use_rc=False)
+
+
+def link_error(res, use_rc=True):
+    text = (res.stdout or '') + (res.stderr or '')
+    return (use_rc and res.returncode != 0) or 'FTP Error' in text or 'Traceback' in text or 'WinError' in text
+
+
+def uploaded_paths(output):
+    """Paths CRD reports as uploaded ('Uploading <path> ... Done'); CRD verifies each after the upload."""
+    out = []
+    for line in output.splitlines():
+        if line.startswith('Uploading') and 'Done' in line:
+            m = re.match(r'Uploading (.+?) \.\.\.', line)
+            if m:
+                out.append(m.group(1))
+    return out
+
+
+def skippable(path):
+    """Only plain paths are excluded by exact name (an fnmatch metacharacter would match more than the one file)."""
+    return bool(path) and not any(c in path for c in '*?[]')
+
+
+def with_skips(cmd, confirmed):
+    extra = []
+    for path in sorted(confirmed):
+        extra += ['--exclude', path]
+    return cmd + extra
 
 
 def norm(data):
@@ -473,6 +554,8 @@ def main():
     ap.add_argument('--status', action='store_true', help='preflight only; upload nothing')
     ap.add_argument('--delay', type=int, default=None, help='base seconds to wait between passes (default: env CRD_LOOP_DELAY, else workflow loopDelaySeconds, else 1)')
     ap.add_argument('--max-delay', dest='max_delay', type=int, default=None, help='ceiling of the back-off after passes that upload nothing (default: env CRD_LOOP_MAX_DELAY, else workflow loopMaxDelaySeconds, else 60)')
+    ap.add_argument('--chunk', type=int, default=20, help='upload at most N files per CRD session (default 20; 0 = whole-range passes, which a dropped link can waste entirely)')
+    ap.add_argument('--no-skip-confirmed', dest='no_skip_confirmed', action='store_true', help='compare every file of the range on every pass (default: files confirmed at the goal in this run are skipped until the final full verification pass)')
     ap.add_argument('--heartbeat', type=int, default=None, help='seconds between "still working" lines (default: env CRD_LOOP_HEARTBEAT, else 15; 0 = off)')
     ap.add_argument('--hang-timeout', dest='hang_timeout', type=int, default=None, help='kill a CRD run that printed nothing for N seconds (default: env CRD_LOOP_HANG_TIMEOUT, else 900; 0 = never)')
     ap.add_argument('--progress-file', dest='progress_file', default=None, help='JSON progress file (default: <CRD_ROOT>/<project>_deploy_progress.json)')
@@ -502,6 +585,8 @@ def main():
     threading.Thread(target=heartbeat_loop, args=(prog, stop_hb), daemon=True).start()
     print('heartbeat every %ds | hang watchdog %s | progress file %s' % (hb, ('%ds' % hang) if hang else 'off', progress_file), flush=True)
     try:
+        if args.chunk > 0 and not args.status:
+            return run_chunked(args, ctx, cmd, prog, delay, max_delay, wait)
         return run_passes(args, ctx, cmd, prog, delay, max_delay, wait)
     finally:
         prog.phase = 'done'
@@ -513,10 +598,25 @@ def main():
 
 def run_passes(args, ctx, cmd, prog, delay, max_delay, wait):
     best, stalls = None, 0
+    base_cmd = cmd
+    confirmed = set()          # paths confirmed at the goal during THIS run (skipped by later passes)
+    full_check = False         # the next preflight is the final, unskipped verification of the whole range
+    use_skip = not args.no_skip_confirmed and not args.status
     for n in range(1, args.max_passes + 1):
         prog.pass_no, prog.pass_started = n, time.time()
+        skipped_now = use_skip and not full_check and bool(confirmed)
+        cmd = with_skips(base_cmd, confirmed) if skipped_now else base_cmd
+        if use_skip and confirmed and not full_check:
+            print('pass %d: skipping %d file(s) already confirmed at the goal in this run' % (n, len(confirmed)), flush=True)
+        if full_check:
+            print('pass %d: FULL VERIFICATION of the whole range (no skipping)' % n, flush=True)
         pre = run_streaming(cmd, CRD_ROOT, 'n\n', prog, 'preflight')
-        counts, diff = classify(pre.stdout)
+        counts, diff, at_goal = classify_full(pre.stdout)
+        if use_skip:
+            if full_check:
+                confirmed = {p for p in at_goal if skippable(p)}   # whatever the full pass sees is the truth
+            else:
+                confirmed |= {p for p in at_goal if skippable(p)}
         todo = counts['DIFF'] + counts['old (to upload)'] + counts['new (to upload)']
         if prog.todo_total is None:
             prog.todo_total = todo
@@ -528,9 +628,14 @@ def run_passes(args, ctx, cmd, prog, delay, max_delay, wait):
                 print('   ', d)
             print('Do not overwrite blindly: someone may have edited the server directly. Inspect, then decide.')
             return 2
+        if todo == 0 and skipped_now:
+            print('nothing left outside the %d confirmed file(s): running one full verification pass' % len(confirmed), flush=True)
+            full_check = True
+            continue
+        full_check = False
         if todo == 0:
             prog.state = 'finished'
-            print('\nALL FILES AT GOAL (%s).' % ctx.goal[:8])
+            print('\nALL FILES AT GOAL (%s), verified by a full unskipped pass.' % ctx.goal[:8])
             if args.move_tag:
                 record_result(ctx, args)
             else:
@@ -551,11 +656,167 @@ def run_passes(args, ctx, cmd, prog, delay, max_delay, wait):
             best, stalls = todo, 0
         answers = ('ra\n' if counts['DIFF'] else '') + 'Y\nY\n'
         res = run_streaming(cmd + ['--deployOnClean'], CRD_ROOT, answers, prog, 'deploy')
+        if use_skip:
+            confirmed |= {p for p in uploaded_paths(res.stdout) if skippable(p)}
         started = len([l for l in res.stdout.splitlines() if l.startswith('Uploading')])
         dropped = ' - link dropped, expected' if ('Error' in res.stderr or 'Error' in res.stdout) else ''
         ok = count_uploaded_ok(res.stdout)
         wait = next_wait(wait, delay, max_delay, ok)
         print('   deploy pass finished (rc %d, %d attempted, %d uploaded)%s; waiting %ds' % (res.returncode, started, ok, dropped, wait), flush=True)
+        prog.phase, prog.wait_until = 'waiting', time.time() + wait
+        prog.wait_reason = 'progress, base wait' if ok > 0 else 'back-off: nothing got through'
+        time.sleep(wait)
+    print('STOP: reached max passes; re-run to continue.')
+    return 4
+
+
+def read_range_listing(base_cmd, timeout=120):
+    """The files of the range as CRD itself announces them ('Local Dirty Files', printed BEFORE any FTP comparison). The CRD process is killed as soon
+    as its first comparison row appears, so this costs (almost) no FTP transfers - a whole-range comparison in one process dies around its 155th file."""
+    env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
+    proc = subprocess.Popen(base_cmd, cwd=CRD_ROOT, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+    try:
+        proc.stdin.close()
+    except OSError:
+        pass
+    paths, buf, started, done = [], b'', time.time(), False
+    while not done and time.time() - started < timeout:
+        try:
+            piece = os.read(proc.stdout.fileno(), 4096)
+        except OSError:
+            break
+        if not piece:
+            break
+        buf += piece
+        while b'\n' in buf:
+            raw, buf = buf.split(b'\n', 1)
+            text = raw.decode('utf-8', 'replace').rstrip('\r')
+            m = re.match(r'^(.*?)\s+\| Git: .* \| Local: ', text)
+            if m:
+                paths.append(m.group(1).strip())
+            elif '|' in text and ('MATCH' in text or 'DIFF' in text or 'MISSING' in text):
+                done = True
+                break
+    proc.kill()
+    proc.wait()
+    return paths
+
+
+def finish_run(ctx, args, prog):
+    prog.state = 'finished'
+    print('\nALL FILES AT GOAL (%s), verified by fresh comparisons in this run.' % ctx.goal[:8])
+    if args.move_tag:
+        record_result(ctx, args)
+    else:
+        print('Record it (local only, never push the tag):')
+        print('  git -C %s tag -f %s %s' % (ctx.repo, ctx.tag, ctx.goal))
+    if args.cleanup:
+        cleanup(ctx)
+    print('Reminder: migrations are NOT run by this script.')
+    return 0
+
+
+def run_chunked(args, ctx, base_cmd, prog, delay, max_delay, wait):
+    """Never a whole-range FTP pass: take the file list from CRD's own announcement, then compare + upload CHUNK files at a time (see the CHUNKS note).
+    Every file must be seen at the goal by a fresh comparison in THIS run, and every file uploaded here is compared again at the end."""
+    size = args.chunk
+    all_paths = []
+    for _ in range(3):
+        all_paths = read_range_listing(base_cmd)
+        if all_paths:
+            break
+        time.sleep(2)
+    if not all_paths:
+        print('STOP: CRD did not announce any file for this range (nothing to deploy, or CRD failed before listing).')
+        return 3
+    prog.files_total = len(all_paths)
+    print('range: CRD announced %d file(s); working in chunks of %d' % (len(all_paths), size), flush=True)
+    pending = list(all_paths)      # state unknown until a chunk comparison says otherwise
+    uploaded = []                  # uploaded in this run (re-verified at the end)
+    verify_queue, verifying, stalls = [], False, 0
+
+    def back_off(reason):
+        nonlocal wait
+        wait = next_wait(wait, delay, max_delay, 0)
+        prog.phase, prog.wait_until, prog.wait_reason = 'waiting', time.time() + wait, reason
+        time.sleep(wait)
+
+    for n in range(1, args.max_passes + 1):
+        prog.pass_no, prog.pass_started = n, time.time()
+        prog.settled = len(all_paths) - len(pending)
+        if verifying and not verify_queue:
+            if not pending:
+                return finish_run(ctx, args, prog)
+            verifying = False
+        if not verifying and not pending:
+            if uploaded:
+                verifying, verify_queue = True, sorted(set(uploaded))
+                print('pass %d: nothing pending: re-comparing the %d file(s) uploaded in this run' % (n, len(verify_queue)), flush=True)
+            else:
+                return finish_run(ctx, args, prog)
+        queue = verify_queue if verifying else pending
+        chunk = queue[:size]
+        keep = set(chunk)
+        cmd = base_cmd
+        for path in all_paths:
+            if path not in keep and skippable(path):
+                cmd = cmd + ['--exclude', path]
+        print('pass %d: %s of %d file(s) (%d pending, %d settled of %d)' % (n, 'VERIFY' if verifying else 'chunk', len(chunk), len(pending), prog.settled, len(all_paths)), flush=True)
+        pre = run_streaming(cmd, CRD_ROOT, 'n\n', prog, 'preflight')
+        rows = classify_rows(pre.stdout)
+        counts, diff, _ = classify_full(pre.stdout)
+        if not table_complete(pre, rows):
+            stalls += 1
+            print('   chunk preflight incomplete (%d of %s rows read): retrying' % (len(rows), expected_rows(pre.stdout) or '?'), flush=True)
+            if stalls >= args.stall:
+                print('STOP: no progress for %d passes. The FTP server is probably throttling; wait 10-15 minutes, re-run.' % stalls)
+                return 3
+            back_off('back-off: preflight died')
+            continue
+        unexpected = [d for d in diff if not (is_truncated_upload(ctx, d) or is_known_history_version(ctx, d))]
+        if unexpected:
+            print('STOP: files that differ from BOTH the old and the new version and are neither a truncated upload nor any version in git history:')
+            for d in unexpected:
+                print('   ', d)
+            print('Do not overwrite blindly: someone may have edited the server directly. Inspect, then decide.')
+            return 2
+        for p, k in rows:
+            if k == 'goal':
+                if p in pending:
+                    pending.remove(p)
+                if p in verify_queue:
+                    verify_queue.remove(p)
+        todo = [p for p, k in rows if k != 'goal']
+        if verifying:
+            if todo:
+                print('   verification found %d file(s) not at the goal: back to uploading them' % len(todo), flush=True)
+                for p in todo:
+                    if p not in pending:
+                        pending.append(p)
+                    if p in verify_queue:
+                        verify_queue.remove(p)
+                verifying = False
+            stalls = 0
+            continue
+        stalls = 0
+        if not todo:
+            continue
+        answers = ('ra\n' if counts['DIFF'] else '') + 'Y\nY\n'
+        res = run_streaming(cmd + ['--deployOnClean'], CRD_ROOT, answers, prog, 'deploy')
+        done = uploaded_paths(res.stdout)
+        for p in done:
+            if p in pending:
+                pending.remove(p)
+            uploaded.append(p)
+        ok = len(done)
+        started = len([l for l in res.stdout.splitlines() if l.startswith('Uploading')])
+        wait = next_wait(wait, delay, max_delay, ok)
+        print('   chunk done (rc %d, %d attempted, %d uploaded, %d still pending)%s; waiting %ds' % (
+            res.returncode, started, ok, len(pending), ' - link dropped, expected' if link_error(res) else '', wait), flush=True)
+        stalls = 0 if ok > 0 else stalls + 1
+        if stalls >= args.stall:
+            print('STOP: no upload got through for %d passes. The FTP server is probably throttling; wait 10-15 minutes, re-run.' % stalls)
+            return 3
         prog.phase, prog.wait_until = 'waiting', time.time() + wait
         prog.wait_reason = 'progress, base wait' if ok > 0 else 'back-off: nothing got through'
         time.sleep(wait)

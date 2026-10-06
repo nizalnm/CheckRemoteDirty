@@ -747,6 +747,16 @@ hand-run pass that dropped, ALWAYS finish with a full preflight showing every fi
 (Stage 7); for the file every page loads (e.g. `system/bootstrap.php`) also check it is byte-identical to the goal, because a
 dropped upload can leave it empty. It does not run database migrations.
 
+**Chunks (`--chunk N`, default 20; 0 = old whole-range passes)**: CRD compares EVERY file of the range inside ONE FTP session before it
+uploads the first byte, and on a slow host that comparison alone takes minutes. A dropped link (`WinError 10013` / `10054` / `BAD_LENGTH`)
+during it kills the run with NOTHING uploaded - and CRD still exits 0, so a whole-range loop can burn an hour uploading nothing (it did,
+on a 155-file range). The loop therefore does ONE full preflight (retried if it dies half-way), then works through the files that still
+need uploading N at a time: each pass is a read-only preflight of just the chunk (DIFF vetting) plus a deploy run of just the chunk, with
+every other path of the range excluded by exact name, so a session lasts about a minute and a drop costs one chunk. Files uploaded and
+verified, or already at the goal, are not compared again in this run; when nothing is pending, ONE final full unskipped preflight must see
+every file at the goal before the run counts as finished (and before the tag moves). When a pass shows `0 attempted, 0 uploaded` and an
+`FTP Error` in CRD's own output, that is this failure, not "nothing to do".
+
 **Heartbeat / "is it stuck?"**: the script streams CRD's output live (child runs unbuffered) and prints a `[hb HH:MM:SS]` line every
 15 s (`--heartbeat N`, env `CRD_LOOP_HEARTBEAT`, 0 = off): pass n/max, phase (PREFLIGHT / DEPLOY / WAITING with the seconds left),
 files uploaded of the total (%, files/min, ETA), the file in flight and how long it has been going, the last file that finished and
