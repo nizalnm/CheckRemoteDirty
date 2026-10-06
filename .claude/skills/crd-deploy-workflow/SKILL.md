@@ -747,6 +747,16 @@ hand-run pass that dropped, ALWAYS finish with a full preflight showing every fi
 (Stage 7); for the file every page loads (e.g. `system/bootstrap.php`) also check it is byte-identical to the goal, because a
 dropped upload can leave it empty. It does not run database migrations.
 
+**Heartbeat / "is it stuck?"**: the script streams CRD's output live (child runs unbuffered) and prints a `[hb HH:MM:SS]` line every
+15 s (`--heartbeat N`, env `CRD_LOOP_HEARTBEAT`, 0 = off): pass n/max, phase (PREFLIGHT / DEPLOY / WAITING with the seconds left),
+files uploaded of the total (%, files/min, ETA), the file in flight and how long it has been going, the last file that finished and
+how long ago, link drops, and a `QUIET` flag with the watchdog limit when CRD has printed nothing for 2 minutes. Each finished file
+also prints `ok [n/total] path`. A hang watchdog (`--hang-timeout`, default 900 s, 0 = off) kills a CRD run that went completely
+silent and lets the loop continue (a dropped pass). The same state is written to `<CRD_ROOT>/<project>_deploy_progress.json` every
+heartbeat (state running/finished/stopped, phase, counts, current file, seconds since last output, pid, `last_update`): when you run
+the script in the background, READ THAT FILE (or the redirected log) to report progress; never pipe the script through
+`Select-Object -Last N` / `tail`, which show nothing until it exits (that is exactly what made a long deploy look frozen).
+
 Wait between passes is ADAPTIVE: start aggressive (base 1 second) and back off only while passes upload nothing: after a pass
 that uploads no file the wait doubles (2, 4, 8 ... up to the ceiling, default 60 seconds) and snaps back to the base as soon as
 a pass gets a file through (early passes with a 3 second pause moved 20-59 files each; a fixed long wait was not what made
