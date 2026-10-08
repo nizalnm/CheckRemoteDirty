@@ -1327,6 +1327,13 @@ def main():
         else:
             print(f"Scanning for dirty files in {working_dir}...")
             dirty_files = get_git_dirty_files(working_dir)
+            
+            if not dirty_files and not args.gitCommitHash:
+                print("Local is clean and no --gitCommitHash specified. Defaulting to target=HEAD and baseline=HEAD~1.")
+                args.gitCommitHash = 'HEAD'
+                if not args.gitBaselineHash:
+                    args.gitBaselineHash = 'HEAD~1'
+
             # Deletion detection needs a git range to diff against - the plain
             # `git status` scan above has no baseline/target pair to derive
             # "removed since X" from, so it's out of scope for this mode.
